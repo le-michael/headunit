@@ -126,7 +126,7 @@ func extract(
 		}
 	}
 
-	return normalize(absPath, tags, props), nil
+	return buildInfoFromTagLib(absPath, tags, props), nil
 }
 
 func hasNoProperties(p taglib.Properties) bool {
@@ -169,7 +169,9 @@ func checkReadableRegularFile(absPath string) error {
 	return nil
 }
 
-func normalize(absPath string, tags map[string][]string, props taglib.Properties) Info {
+// buildInfoFromTagLib merges raw TagLib tags and stream properties into a
+// normalized Info, falling back to absPath and defaults for missing fields.
+func buildInfoFromTagLib(absPath string, tags map[string][]string, props taglib.Properties) Info {
 	title := firstTagValue(tags[taglib.Title])
 	if title == "" {
 		title = titleFromFilename(absPath)
