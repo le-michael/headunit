@@ -10,6 +10,7 @@ Run from the repository root once the Go module and Docker setup are in place:
 - Run full test suite: `go test -race ./...`
 - Run a single test: `go test -race -run TestName ./internal/<pkg>`
 - Static analysis: `go vet ./...`
+- Format code: `gofmt -w .`
 - Run locally via Docker Compose: `docker compose up -d --build`
 
 ## Architecture & Boundaries
@@ -19,6 +20,17 @@ Run from the repository root once the Go module and Docker setup are in place:
 - **Library decoupling:** Never mirror the host directory structure in the in-app library. Treat `/music` as read-only (`:ro`) and store all server state under `/data`.
 - **Canonical API tracker:** Reference `docs/opensubsonic_compatibility.md` as the source of truth for OpenSubsonic coverage. Update its status rows and summary counts whenever endpoints, stubs, error codes, or protocol features change.
 - **Restricted files:** Never commit `.env`, secrets, or local database files (`*.db`, `*.db-wal`, `*.db-shm`).
+
+## Go Style & Readability
+
+Follow the [Google Go Style Guide](https://google.github.io/styleguide/go/) (`/guide`, `/decisions`, and `/best-practices`), prioritizing clarity, simplicity, concision, maintainability, and consistency:
+
+- **Formatting:** Always format Go code with `gofmt`.
+- **Naming:** Use `MixedCaps` (avoid underscores outside `*_test.go`), use consistent initialisms (`ID`, `HTTP`, `URL`, `SQL`), avoid stuttering across package, receiver, and function names (e.g., `store.Open`, not `store.OpenStore`), and keep receiver names short and consistent.
+- **Error handling & control flow:** Handle errors explicitly where they occur, wrap with context (`fmt.Errorf("...: %w", err)`), indent error paths with early returns to keep the happy path unindented, and never use `panic` for normal error handling.
+- **Contexts & interfaces:** Pass `context.Context` as the first parameter (`ctx`) and never store it in a struct. Define interfaces at the consumer rather than the producer when practical.
+- **Comments:** Write doc comments on exported symbols as complete sentences starting with the symbol's name; explain *why*, not *what*.
+- **Tests:** Prefer table-driven tests, mark helpers with `t.Helper()`, and emit clear `got`/`want` failure messages (avoid third-party assertion frameworks).
 
 ## Testing Instructions
 
