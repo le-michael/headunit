@@ -29,6 +29,7 @@ Follow the [Google Go Style Guide](https://google.github.io/styleguide/go/) (`/g
 - **Naming:** Use `MixedCaps` (avoid underscores outside `*_test.go`), use consistent initialisms (`ID`, `HTTP`, `URL`, `SQL`), avoid stuttering across package, receiver, and function names (e.g., `store.Open`, not `store.OpenStore`), and keep receiver names short and consistent.
 - **Error handling & control flow:** Handle errors explicitly where they occur, wrap with context (`fmt.Errorf("...: %w", err)`), indent error paths with early returns to keep the happy path unindented, and never use `panic` for normal error handling.
 - **Contexts & interfaces:** Pass `context.Context` as the first parameter (`ctx`) and never store it in a struct. Define interfaces at the consumer rather than the producer when practical.
+- **File size & pragmatic abstraction:** Avoid god files; split responsibilities and introduce abstractions when they clarify boundaries or rein in growing complexity. Do not over-abstract—only extract logic into separate structs or files when it genuinely makes sense and keeps changes easy to review.
 - **Comments:** Write doc comments on exported symbols as complete sentences starting with the symbol's name; explain *why*, not *what*.
 - **Tests:** Prefer table-driven tests, mark helpers with `t.Helper()`, and emit clear `got`/`want` failure messages (avoid third-party assertion frameworks).
 
@@ -43,4 +44,5 @@ Follow the [Google Go Style Guide](https://google.github.io/styleguide/go/) (`/g
 - **Always use PRs:** Never push changes directly to `main`; create a feature branch and open a pull request.
 - **Small, stackable PRs:** Keep each PR small and focused on a single concern. For larger features, break work into a stack of small PRs for review.
 - **Conventional Commits:** Use [Conventional Commits](https://www.conventionalcommits.org/) for all commit messages and PR titles (e.g., `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`).
+- **PR description:** Always include a simple, plain-language `Summary` section explaining why the change is being made (accessible to any reader, without referencing "ELI5"), followed by a clear breakdown of the delta being applied.
 - **Pre-PR checklist:** Ensure tests pass, scope is minimal, and `docs/opensubsonic_compatibility.md` is updated if OpenSubsonic compatibility changed.
