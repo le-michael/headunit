@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  format:
+    name: Format & Static Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            printf '::error::Unformatted Go files:\n%s\n' "${unformatted}"
+            exit 1
+          fi
+      - name: Run go vet
+        run: go vet ./...
+      - name: Verify Go modules
+        run: |
+          go mod tidy -diff
+          go mod verify
+      - name: Validate shell scripts and Docker Compose config
+        run: |
+          test -x entrypoint.sh && test -x scripts/ci/docker-e2e.sh
+          sh -n entrypoint.sh && bash -n scripts/ci/docker-e2e.sh
+          MUSIC_DIR=/tmp docker compose config --quiet
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Run unit tests
+        run: go test -race -count=1 -v ./internal/...
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Build static Go binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/headunit" ./cmd/headunit
+          test -x "${RUNNER_TEMP}/headunit"
+      - name: Build Docker image
+        run: docker build -t headunit:ci .
+
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Run Go E2E tests
+        run: go test -race -count=1 -v ./cmd/headunit
+      - name: Run Docker Compose E2E smoke test
+        run: ./scripts/ci/docker-e2e.sh
