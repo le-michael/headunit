@@ -1,0 +1,27 @@
+services:
+  headunit:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-4533}:4533"
+    environment:
+      PORT: "4533"
+      MUSIC_DIR: "/music"
+      DATA_DIR: "/data"
+      SCAN_INTERVAL: "${SCAN_INTERVAL:-5m}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+    volumes:
+      # Mount the music library read-only. On SELinux-enforcing hosts, set
+      # MUSIC_MOUNT_OPTS=ro,z in .env (avoid :z on /home/$USER or NFS/SMB mounts).
+      - "${MUSIC_DIR:?Set MUSIC_DIR in .env}:/music:${MUSIC_MOUNT_OPTS:-ro}"
+      - headunit_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 5 -O - http://127.0.0.1:4533/rest/ping | grep -q 'status=\"ok\"'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  headunit_data:
