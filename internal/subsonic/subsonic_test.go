@@ -2,6 +2,7 @@ package subsonic_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -19,6 +20,8 @@ import (
 
 	"headunit/internal/auth"
 	"headunit/internal/scanner"
+	"headunit/internal/store"
+	"headunit/internal/stream"
 	"headunit/internal/subsonic"
 )
 
@@ -81,6 +84,46 @@ func (*trackingReadCloser) Close() error {
 	return nil
 }
 
+type noopLibraryStore struct{}
+
+func (noopLibraryStore) ListArtists(context.Context) ([]store.ArtistSummary, error) {
+	return []store.ArtistSummary{}, nil
+}
+
+func (noopLibraryStore) GetArtist(context.Context, string) (store.ArtistSummary, []store.AlbumSummary, error) {
+	return store.ArtistSummary{}, nil, store.ErrNotFound
+}
+
+func (noopLibraryStore) GetAlbum(context.Context, string) (store.AlbumSummary, []store.Track, error) {
+	return store.AlbumSummary{}, nil, store.ErrNotFound
+}
+
+func (noopLibraryStore) ListAlbums(context.Context, store.AlbumListQuery) ([]store.AlbumSummary, error) {
+	return []store.AlbumSummary{}, nil
+}
+
+func (noopLibraryStore) GetTrack(context.Context, string) (*store.Track, error) {
+	return nil, store.ErrNotFound
+}
+
+func (noopLibraryStore) Search3(context.Context, store.Search3Query) (store.Search3Result, error) {
+	return store.Search3Result{
+		Artists: []store.ArtistSummary{},
+		Albums:  []store.AlbumSummary{},
+		Songs:   []store.Track{},
+	}, nil
+}
+
+type noopStreamer struct{}
+
+func (noopStreamer) Stream(http.ResponseWriter, *http.Request, *store.Track, stream.StreamOptions) error {
+	return nil
+}
+
+func (noopStreamer) Close() error {
+	return nil
+}
+
 type xmlEnvelope struct {
 	XMLName                xml.Name                         `xml:"subsonic-response"`
 	Xmlns                  string                           `xml:"xmlns,attr"`
@@ -97,6 +140,13 @@ type xmlEnvelope struct {
 	Playlists              *subsonic.Playlists              `xml:"playlists"`
 	Genres                 *subsonic.Genres                 `xml:"genres"`
 	Starred2               *subsonic.Starred2               `xml:"starred2"`
+	MusicFolders           *subsonic.MusicFolders           `xml:"musicFolders"`
+	Artists                *subsonic.ArtistsID3             `xml:"artists"`
+	Artist                 *subsonic.ArtistWithAlbumsID3    `xml:"artist"`
+	Album                  *subsonic.AlbumWithSongsID3      `xml:"album"`
+	AlbumList2             *subsonic.AlbumList2             `xml:"albumList2"`
+	Song                   *subsonic.Child                  `xml:"song"`
+	SearchResult3          *subsonic.SearchResult3          `xml:"searchResult3"`
 }
 
 type jsonEnvelope struct {
@@ -106,8 +156,10 @@ type jsonEnvelope struct {
 func newTestHandler(t *testing.T, authImpl auth.Authenticator, scanImpl subsonic.ScanStatusProvider) http.Handler {
 	t.Helper()
 	h, err := subsonic.NewHandler(subsonic.Dependencies{
-		Auth:    authImpl,
-		Scanner: scanImpl,
+		Auth:     authImpl,
+		Scanner:  scanImpl,
+		Store:    noopLibraryStore{},
+		Streamer: noopStreamer{},
 	})
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
@@ -215,17 +267,27 @@ func TestNewHandler_Validation(t *testing.T) {
 	}{
 		{
 			name:    "nil auth",
-			deps:    subsonic.Dependencies{Auth: nil, Scanner: scan},
+			deps:    subsonic.Dependencies{Auth: nil, Scanner: scan, Store: noopLibraryStore{}, Streamer: noopStreamer{}},
 			wantErr: true,
 		},
 		{
 			name:    "nil scanner",
-			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: nil},
+			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: nil, Store: noopLibraryStore{}, Streamer: noopStreamer{}},
+			wantErr: true,
+		},
+		{
+			name:    "nil store",
+			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: nil, Streamer: noopStreamer{}},
+			wantErr: true,
+		},
+		{
+			name:    "nil streamer",
+			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: noopLibraryStore{}, Streamer: nil},
 			wantErr: true,
 		},
 		{
 			name:    "nil logger defaults cleanly",
-			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Logger: nil},
+			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: noopLibraryStore{}, Streamer: noopStreamer{}, Logger: nil},
 			wantErr: false,
 		},
 	}

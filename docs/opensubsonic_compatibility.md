@@ -30,15 +30,15 @@ This living document tracks **Headunit**'s compatibility against the **Subsonic 
 
 | Surface | Implemented / Total | MVP Target Progress | Notes |
 | :--- | :---: | :---: | :--- |
-| Core Protocol & Wire Features | `8 / 14` | `8 / 9` | XML/JSON, dual routes, POST form parsing, CORS, Range streaming, no-op auth seam |
-| Official Error Codes | `2 / 12` | `2 / 3` | MVP emits codes `0`, `10`, `70` (`40` wired at `auth.Middleware` seam) |
+| Core Protocol & Wire Features | `9 / 14` | `9 / 9` | XML/JSON, dual routes, POST form parsing, CORS, Range streaming, no-op auth seam |
+| Official Error Codes | `3 / 12` | `3 / 3` | MVP emits codes `0`, `10`, `70` (`40` wired at `auth.Middleware` seam) |
 | OpenSubsonic Extensions | `0 / 10` | `0 / 0` | `getOpenSubsonicExtensions` returns `[]` in MVP |
-| API Endpoints (Total) | `5 / 87` | `10 / 18` (`5 / 13` full + `5 / 5` stubs) | 16 official categories (`13` MVP + `5` MVP Stub + `68` Post-MVP + `1` Deprecated) |
+| API Endpoints (Total) | `13 / 87` | `18 / 18` (`13 / 13` full + `5 / 5` stubs) | 16 official categories (`13` MVP + `5` MVP Stub + `68` Post-MVP + `1` Deprecated) |
 | OpenSubsonic Entity Extensions | `0 / 5` entity groups | `0 / 0` | `Child`, `AlbumID3`, `ArtistID3`, `Playlist`, `Error` |
 
 ---
 
-## 2. Core Protocol & Wire Features (`8 / 14`)
+## 2. Core Protocol & Wire Features (`9 / 14`)
 
 | Feature | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
@@ -50,7 +50,7 @@ This living document tracks **Headunit**'s compatibility against the **Subsonic 
 | JSONP response format (`f=jsonp&callback=...`) | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; modern web clients use CORS + `f=json`. |
 | OpenSubsonic root envelope attributes (`openSubsonic=true`, `type`, `serverVersion`) | OpenSubsonic | `Implemented` | `MVP` | Emits `version="1.16.1"`, `type="headunit"`, `serverVersion="0.1.0"`, `openSubsonic=true` on all responses. |
 | CORS headers & `OPTIONS` preflight for web clients | Web/Client Compat | `Implemented` | `MVP` | Enables browser-based clients (e.g., Feishin web); handles `OPTIONS` with `204 No Content` before auth. |
-| HTTP byte-range direct streaming (`Accept-Ranges`, `Range` → `206`, `416`, `ETag`, `If-Range`, `HEAD`) | HTTP / RFC 9110 | `Not Implemented` | `MVP` | Backed by `DirectStreamer` using `os.OpenRoot` + `http.ServeContent` with strong `ETag`. |
+| HTTP byte-range direct streaming (`Accept-Ranges`, `Range` → `206`, `416`, `ETag`, `If-Range`, `HEAD`) | HTTP / RFC 9110 | `Implemented` | `MVP` | Backed by `DirectStreamer` using `os.OpenRoot` + `http.ServeContent` with strong `ETag`. |
 | On-the-fly transcoding (`ffmpeg` `maxBitRate`/`format` negotiation) | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | `ffmpeg` is pre-bundled in the Docker image and playback routes through the `stream.Streamer` seam; MVP ignores `maxBitRate`/`format`. |
 | Authentication: No-op pass-through seam (`auth.Middleware`) | Headunit MVP | `Implemented` | `MVP` | `NoopAuthenticator` accepts any or no credentials and attaches a synthetic principal until real auth is enabled. |
 | Authentication: Salted MD5 token (`u` + `t` + `s`, min 6-char salt) | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Swap in an `auth.Authenticator` implementation in `cmd/headunit/main.go`. |
@@ -59,14 +59,14 @@ This living document tracks **Headunit**'s compatibility against the **Subsonic 
 
 ---
 
-## 3. Official Subsonic / OpenSubsonic Error Codes (`2 / 12`)
+## 3. Official Subsonic / OpenSubsonic Error Codes (`3 / 12`)
 
 All Subsonic/OpenSubsonic application errors are returned inside an HTTP `200 OK` envelope with `status="failed"` and an `<error code="..." message="..."/>` (XML) or `"error": {"code": ..., "message": "..."}` (JSON) element.
 
 | Code | Spec Origin | Official Meaning | Status | Target | Notes |
 | :---: | :--- | :--- | :--- | :--- | :--- |
 | `0` | Subsonic 1.16.1 | A generic error. | `Implemented` | `MVP` | Used for malformed/oversized form bodies and unexpected server errors. |
-| `10` | Subsonic 1.16.1 | Required parameter is missing. | `Not Implemented` | `MVP` | Returned for missing required parameters (e.g., `id`, `type`) or unknown `getAlbumList2` `type`. |
+| `10` | Subsonic 1.16.1 | Required parameter is missing. | `Implemented` | `MVP` | Returned for missing required parameters (e.g., `id`, `type`) or unknown `getAlbumList2` `type`. |
 | `20` | Subsonic 1.16.1 | Incompatible Subsonic REST protocol version. Client must upgrade. | `Not Implemented` | `Post-MVP` | MVP does not enforce strict client `v` version gating. |
 | `30` | Subsonic 1.16.1 | Incompatible Subsonic REST protocol version. Server must upgrade. | `Not Implemented` | `Post-MVP` | MVP does not enforce strict client `v` version gating. |
 | `40` | Subsonic 1.16.1 | Wrong username or password. | `Not Implemented` | `Post-MVP` | Wired in the `auth.Middleware` seam; not emitted while `NoopAuthenticator` is active. |
@@ -99,7 +99,7 @@ Advertised via `/rest/getOpenSubsonicExtensions`. Headunit returns an empty list
 
 ---
 
-## 5. Complete Endpoints Compatibility Matrix (`5 / 87`)
+## 5. Complete Endpoints Compatibility Matrix (`13 / 87`)
 
 All implemented endpoints are served under both `/rest/<method>` and `/rest/<method>.view` (except `hls.m3u8`, whose canonical path is `/rest/hls.m3u8`).
 
@@ -112,18 +112,18 @@ All implemented endpoints are served under both `/rest/<method>` and `/rest/<met
 | `getOpenSubsonicExtensions` | OpenSubsonic | `Implemented` | `MVP` | Returns empty `openSubsonicExtensions: []` (zero extension claims in MVP). Spec requires unauthenticated public access (implicitly satisfied via `NoopAuthenticator`; must bypass `auth.Middleware` when real auth is added). |
 | `tokenInfo` | OpenSubsonic (`apiKeyAuthentication`) | `Not Implemented` | `Post-MVP` | Deferred until `apiKeyAuthentication` extension is implemented. |
 
-### 5.2 Browsing (`0 / 20`)
+### 5.2 Browsing (`5 / 20`)
 
 | Endpoint | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `getMusicFolders` | Subsonic 1.16.1 | `Not Implemented` | `MVP` | Returns single virtual folder `musicFolder: [{id: 1, name: "Music"}]`. |
+| `getMusicFolders` | Subsonic 1.16.1 | `Implemented` | `MVP` | Returns single virtual folder `musicFolder: [{id: 1, name: "Music"}]`. |
 | `getIndexes` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; Headunit organizes tracks via ID3 tags rather than mirroring host directories. |
 | `getMusicDirectory` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; folder-based browsing is out of scope for MVP. |
 | `getGenres` | Subsonic 1.16.1 | `Stub` | `MVP (Stub)` | Returns empty `genres: {genre: []}` to prevent client sync errors. |
-| `getArtists` | Subsonic 1.16.1 | `Not Implemented` | `MVP` | ID3 artists derived from `album_artist` (`ar_*`), bucketed `A`–`Z` + `#` (`ignoredArticles: "The El La Los Las Le Les"`). |
-| `getArtist` | Subsonic 1.16.1 | `Not Implemented` | `MVP` | Returns artist + albums (`al_*`) by `id`; missing `id` → error `10`, unknown → error `70`. |
-| `getAlbum` | Subsonic 1.16.1 | `Not Implemented` | `MVP` | Returns album + songs (`tr_*`) ordered by `disc_num, track_num, title`; missing `id` → error `10`, unknown → error `70`. |
-| `getSong` | Subsonic 1.16.1 | `Not Implemented` | `MVP` | Returns single `Child` song entity by `id`; missing `id` → error `10`, unknown → error `70`. |
+| `getArtists` | Subsonic 1.16.1 | `Implemented` | `MVP` | ID3 artists derived from `album_artist` (`ar_*`), bucketed `A`–`Z` + `#` (`ignoredArticles: "The El La Los Las Le Les"`). |
+| `getArtist` | Subsonic 1.16.1 | `Implemented` | `MVP` | Returns artist + albums (`al_*`) by `id`; missing `id` → error `10`, unknown → error `70`. |
+| `getAlbum` | Subsonic 1.16.1 | `Implemented` | `MVP` | Returns album + songs (`tr_*`) ordered by `disc_num, track_num, title`; missing `id` → error `10`, unknown → error `70`. |
+| `getSong` | Subsonic 1.16.1 | `Implemented` | `MVP` | Returns single `Child` song entity by `id`; missing `id` → error `10`, unknown → error `70`. |
 | `getVideos` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Headunit indexes audio files only in MVP. |
 | `getVideoInfo` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Headunit indexes audio files only in MVP. |
 | `getArtistInfo` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; no external metadata/biography scrapers in MVP. |
@@ -137,25 +137,25 @@ All implemented endpoints are served under both `/rest/<method>` and `/rest/<met
 | `getSonicSimilarTracks` | OpenSubsonic (`sonicSimilarity`) | `Not Implemented` | `Post-MVP` | Deferred; requires `sonicSimilarity` audio analysis. |
 | `findSonicPath` | OpenSubsonic (`sonicSimilarity`) | `Not Implemented` | `Post-MVP` | Deferred; requires `sonicSimilarity` audio analysis. |
 
-### 5.3 Lists (`0 / 7`)
+### 5.3 Lists (`1 / 7`)
 
 | Endpoint | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | `getAlbumList` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; folder-based album listing is out of scope for MVP (use `getAlbumList2`). |
-| `getAlbumList2` | Subsonic 1.16.1 | `Not Implemented` | `MVP` | Supports `alphabeticalByName`, `alphabeticalByArtist`, `newest`, `random` (`size` def `10`/max `500`, `offset` def `0`); deferred valid types (`recent`, `frequent`, `highest`, `starred`, `byYear`, `byGenre`) return empty `album: []`; missing/unknown `type` → error `10`. |
+| `getAlbumList2` | Subsonic 1.16.1 | `Implemented` | `MVP` | Supports `alphabeticalByName`, `alphabeticalByArtist`, `newest`, `random` (`size` def `10`/max `500`, `offset` def `0`); deferred valid types (`recent`, `frequent`, `highest`, `starred`, `byYear`, `byGenre`) return empty `album: []`; missing/unknown `type` → error `10`. |
 | `getRandomSongs` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Explicitly deferred from MVP. |
 | `getSongsByGenre` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred alongside full genre browsing. |
 | `getNowPlaying` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; no live playback session tracking in MVP. |
 | `getStarred` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; folder-based favorites are out of scope for MVP. |
 | `getStarred2` | Subsonic 1.16.1 | `Stub` | `MVP (Stub)` | Returns empty `starred2: {artist: [], album: [], song: []}` to prevent client sync errors. |
 
-### 5.4 Searching (`0 / 3`)
+### 5.4 Searching (`1 / 3`)
 
 | Endpoint | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | `search` | Subsonic 1.16.1 (Deprecated) | `Not Implemented` | `Deprecated` | Deprecated in Subsonic 1.16.1; superseded by `search2` and `search3`. |
 | `search2` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; folder-based search is out of scope for MVP (use `search3`). |
-| `search3` | Subsonic 1.16.1 (+ OpenSubsonic) | `Not Implemented` | `MVP` | ID3 substring search across artists, albums, and songs; implements OpenSubsonic empty-query bulk sync (normalizes `query=` and literal `query=""` / `%22%22` to match-all); defaults omitted counts to `20` (max `500`), respects explicit `0` counts, and orders with deterministic ID tie-breakers. |
+| `search3` | Subsonic 1.16.1 (+ OpenSubsonic) | `Implemented` | `MVP` | ID3 substring search across artists, albums, and songs; implements OpenSubsonic empty-query bulk sync (normalizes `query=` and literal `query=""` / `%22%22` to match-all); defaults omitted counts to `20` (max `500`), respects explicit `0` counts, and orders with deterministic ID tie-breakers. |
 
 ### 5.5 Playlists (`0 / 5`)
 
@@ -167,11 +167,11 @@ All implemented endpoints are served under both `/rest/<method>` and `/rest/<met
 | `updatePlaylist` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; playlists persistence is out of scope for MVP. |
 | `deletePlaylist` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; playlists persistence is out of scope for MVP. |
 
-### 5.6 Media Retrieval (`0 / 8`)
+### 5.6 Media Retrieval (`1 / 8`)
 
 | Endpoint | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `stream` | Subsonic 1.16.1 (+ OpenSubsonic) | `Not Implemented` | `MVP` | Raw direct-stream via `DirectStreamer` (`os.OpenRoot`) with HTTP Range (`200`/`206`/`416`/`HEAD`, `ETag`); `maxBitRate`/`format` ignored in MVP; never scrobbles/increments play counts per OpenSubsonic spec; missing `id` → HTTP 200 error `10`, missing track/file → HTTP 200 error `70` written before sending audio headers. |
+| `stream` | Subsonic 1.16.1 (+ OpenSubsonic) | `Implemented` | `MVP` | Raw direct-stream via `DirectStreamer` (`os.OpenRoot`) with HTTP Range (`200`/`206`/`416`/`HEAD`, `ETag`); `maxBitRate`/`format` ignored in MVP; never scrobbles/increments play counts per OpenSubsonic spec; missing `id` → HTTP 200 error `10`, missing track/file → HTTP 200 error `70` written before sending audio headers. |
 | `download` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; `getUser` reports `downloadRole: false` in MVP. |
 | `hls.m3u8` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; canonical path `/rest/hls.m3u8` (no `.view` suffix); no HLS segmentation/transcoding in MVP. |
 | `getCaptions` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; video captions are out of scope for MVP. |
