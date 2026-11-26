@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +21,7 @@ import (
 
 	"headunit/internal/metadata"
 	"headunit/internal/store"
+	"headunit/internal/testutil"
 )
 
 const testWaitTimeout = 10 * time.Second
@@ -202,87 +202,6 @@ func mapKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-func minimalWAVBytes() []byte {
-	const (
-		channels      uint16 = 1
-		sampleRate    uint32 = 8000
-		bitsPerSample uint16 = 16
-		blockAlign           = channels * bitsPerSample / 8
-		byteRate             = sampleRate * uint32(blockAlign)
-		dataSize      uint32 = byteRate * 2 // 32,000 bytes = 2 seconds
-	)
-
-	buf := make([]byte, 44+dataSize)
-	copy(buf[0:4], "RIFF")
-	binary.LittleEndian.PutUint32(buf[4:8], 36+dataSize)
-	copy(buf[8:12], "WAVE")
-	copy(buf[12:16], "fmt ")
-	binary.LittleEndian.PutUint32(buf[16:20], 16)
-	binary.LittleEndian.PutUint16(buf[20:22], 1) // PCM
-	binary.LittleEndian.PutUint16(buf[22:24], channels)
-	binary.LittleEndian.PutUint32(buf[24:28], sampleRate)
-	binary.LittleEndian.PutUint32(buf[28:32], byteRate)
-	binary.LittleEndian.PutUint16(buf[32:34], blockAlign)
-	binary.LittleEndian.PutUint16(buf[34:36], bitsPerSample)
-	copy(buf[36:40], "data")
-	binary.LittleEndian.PutUint32(buf[40:44], dataSize)
-	return buf
-}
-
-func writeMinimalWAV(t *testing.T, path string) {
-	t.Helper()
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("os.MkdirAll(%q): %v", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, minimalWAVBytes(), 0o600); err != nil {
-		t.Fatalf("writeMinimalWAV(%q): %v", path, err)
-	}
-}
-
-func writeMinimalMP3(t *testing.T, path string) {
-	t.Helper()
-
-	const (
-		frameSize  = 417
-		frameCount = 77
-	)
-
-	buf := make([]byte, frameSize*frameCount)
-	for i := range frameCount {
-		off := i * frameSize
-		buf[off] = 0xFF
-		buf[off+1] = 0xFB
-		buf[off+2] = 0x90
-		buf[off+3] = 0x00
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("os.MkdirAll(%q): %v", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, buf, 0o600); err != nil {
-		t.Fatalf("writeMinimalMP3(%q): %v", path, err)
-	}
-}
-
-func writeTags(t *testing.T, path string, tags map[string][]string) {
-	t.Helper()
-	if err := taglib.WriteTags(path, tags, taglib.Clear); err != nil {
-		t.Fatalf("taglib.WriteTags(%q): %v", path, err)
-	}
-}
-
-func writeBytes(t *testing.T, path string, data []byte) {
-	t.Helper()
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("os.MkdirAll(%q): %v", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("os.WriteFile(%q): %v", path, err)
-	}
-}
-
 func TestNew_Validation(t *testing.T) {
 	st := openTestStore(t)
 	_, logger := newLogCapture()
@@ -373,8 +292,8 @@ func TestScanNow_RecursiveAndIgnored(t *testing.T) {
 		musicDir := t.TempDir()
 
 		mp3Path := filepath.Join(musicDir, "Daft Punk", "Discovery", "01 - One More Time.mp3")
-		writeMinimalMP3(t, mp3Path)
-		writeTags(t, mp3Path, map[string][]string{
+		testutil.WriteMinimalMP3(t, mp3Path)
+		testutil.WriteTags(t, mp3Path, map[string][]string{
 			taglib.Title:       {"One More Time"},
 			taglib.Artist:      {"Daft Punk"},
 			taglib.AlbumArtist: {"Daft Punk"},
@@ -385,8 +304,8 @@ func TestScanNow_RecursiveAndIgnored(t *testing.T) {
 		})
 
 		taggedWAV := filepath.Join(musicDir, "Various", "02 - Studio.wav")
-		writeMinimalWAV(t, taggedWAV)
-		writeTags(t, taggedWAV, map[string][]string{
+		testutil.WriteMinimalWAV(t, taggedWAV)
+		testutil.WriteTags(t, taggedWAV, map[string][]string{
 			taglib.Title:       {"Studio Session"},
 			taglib.Artist:      {"Wave Guest"},
 			taglib.AlbumArtist: {"Various Artists"},
@@ -394,32 +313,32 @@ func TestScanNow_RecursiveAndIgnored(t *testing.T) {
 		})
 
 		untaggedWAV := filepath.Join(musicDir, "Loose", "03 - Raw Wave.wav")
-		writeMinimalWAV(t, untaggedWAV)
+		testutil.WriteMinimalWAV(t, untaggedWAV)
 
 		corruptMP3 := filepath.Join(musicDir, "Loose", "04 - Corrupt Audio.mp3")
-		writeBytes(t, corruptMP3, []byte("not real mp3 audio bytes"))
+		testutil.WriteBytes(t, corruptMP3, []byte("not real mp3 audio bytes"))
 
 		audioNamedDirTrack := filepath.Join(musicDir, "MyMix.mp3", "01 - Inside.wav")
-		writeMinimalWAV(t, audioNamedDirTrack)
+		testutil.WriteMinimalWAV(t, audioNamedDirTrack)
 
 		// Ignored files, hidden dirs, unsupported formats, 0-byte audio, and symlinks.
-		writeMinimalWAV(t, filepath.Join(musicDir, ".DS_Store"))
-		writeMinimalMP3(t, filepath.Join(musicDir, "._Track.mp3"))
-		writeMinimalWAV(t, filepath.Join(musicDir, ".hidden", "song.wav"))
-		writeMinimalWAV(t, filepath.Join(musicDir, "song.flac.part"))
-		writeMinimalMP3(t, filepath.Join(musicDir, "song.mp3.tmp"))
-		writeMinimalWAV(t, filepath.Join(musicDir, "song.wav.filepart"))
-		writeMinimalMP3(t, filepath.Join(musicDir, "song.m4a.crdownload"))
-		writeBytes(t, filepath.Join(musicDir, "notes.txt"), []byte("liner notes"))
-		writeBytes(t, filepath.Join(musicDir, "empty.wav"), nil)
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, ".DS_Store"))
+		testutil.WriteMinimalMP3(t, filepath.Join(musicDir, "._Track.mp3"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, ".hidden", "song.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "song.flac.part"))
+		testutil.WriteMinimalMP3(t, filepath.Join(musicDir, "song.mp3.tmp"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "song.wav.filepart"))
+		testutil.WriteMinimalMP3(t, filepath.Join(musicDir, "song.m4a.crdownload"))
+		testutil.WriteBytes(t, filepath.Join(musicDir, "notes.txt"), []byte("liner notes"))
+		testutil.WriteBytes(t, filepath.Join(musicDir, "empty.wav"), nil)
 
 		outsideTarget := filepath.Join(t.TempDir(), "outside.wav")
-		writeMinimalWAV(t, outsideTarget)
+		testutil.WriteMinimalWAV(t, outsideTarget)
 		if err := os.Symlink(outsideTarget, filepath.Join(musicDir, "linked-file.wav")); err != nil {
 			t.Fatalf("os.Symlink(file): %v", err)
 		}
 		outsideDir := t.TempDir()
-		writeMinimalWAV(t, filepath.Join(outsideDir, "inside-linked-dir.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(outsideDir, "inside-linked-dir.wav"))
 		if err := os.Symlink(outsideDir, filepath.Join(musicDir, "linked-dir")); err != nil {
 			t.Fatalf("os.Symlink(dir): %v", err)
 		}
@@ -476,7 +395,7 @@ func TestScanNow_RecursiveAndIgnored(t *testing.T) {
 		st := openTestStore(t)
 		parent := t.TempDir()
 		dotRoot := filepath.Join(parent, ".music-root")
-		writeMinimalWAV(t, filepath.Join(dotRoot, "Sub", "01 - Dot Root Track.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dotRoot, "Sub", "01 - Dot Root Track.wav"))
 
 		rootLink := filepath.Join(parent, "music-symlink")
 		if err := os.Symlink(dotRoot, rootLink); err != nil {
@@ -511,10 +430,10 @@ func TestScanNow_FastPathAndIncremental(t *testing.T) {
 
 	p1 := filepath.Join(musicDir, "01 - Alpha.wav")
 	p2 := filepath.Join(musicDir, "02 - Beta.wav")
-	writeMinimalWAV(t, p1)
-	writeMinimalWAV(t, p2)
-	writeTags(t, p1, map[string][]string{taglib.Title: {"Alpha v1"}})
-	writeTags(t, p2, map[string][]string{taglib.Title: {"Beta v1"}})
+	testutil.WriteMinimalWAV(t, p1)
+	testutil.WriteMinimalWAV(t, p2)
+	testutil.WriteTags(t, p1, map[string][]string{taglib.Title: {"Alpha v1"}})
+	testutil.WriteTags(t, p2, map[string][]string{taglib.Title: {"Beta v1"}})
 
 	svc := newTestService(t, musicDir, 0, st, nil)
 	var extractCalls atomic.Int32
@@ -565,7 +484,7 @@ func TestScanNow_FastPathAndIncremental(t *testing.T) {
 	}
 	orig1 = mustGetTrackByRelPath(t, st, "01 - Alpha.wav")
 
-	writeTags(t, p1, map[string][]string{taglib.Title: {"Alpha v2 Updated"}})
+	testutil.WriteTags(t, p1, map[string][]string{taglib.Title: {"Alpha v2 Updated"}})
 	extractCalls.Store(0)
 	if err := svc.ScanNow(context.Background()); err != nil {
 		t.Fatalf("incremental edit ScanNow() unexpected error: %v", err)
@@ -607,8 +526,8 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 		musicDir := t.TempDir()
 		p1 := filepath.Join(musicDir, "01 - One.wav")
 		p2 := filepath.Join(musicDir, "02 - Two.wav")
-		writeMinimalWAV(t, p1)
-		writeMinimalWAV(t, p2)
+		testutil.WriteMinimalWAV(t, p1)
+		testutil.WriteMinimalWAV(t, p2)
 
 		logs, logger := newLogCapture()
 		svc := newTestService(t, musicDir, 0, st, logger)
@@ -663,9 +582,9 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 		st := openTestStore(t)
 		musicDir := t.TempDir()
 		blockedDir := filepath.Join(musicDir, "blocked")
-		writeMinimalWAV(t, filepath.Join(blockedDir, "01 - HiddenByPerm.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(blockedDir, "01 - HiddenByPerm.wav"))
 		removedFile := filepath.Join(musicDir, "02 - StaleIfHealthy.wav")
-		writeMinimalWAV(t, removedFile)
+		testutil.WriteMinimalWAV(t, removedFile)
 
 		logs, logger := newLogCapture()
 		svc := newTestService(t, musicDir, 0, st, logger)
@@ -681,7 +600,7 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 		if err := os.Remove(removedFile); err != nil {
 			t.Fatal(err)
 		}
-		writeMinimalWAV(t, filepath.Join(musicDir, "03 - HealthyNew.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "03 - HealthyNew.wav"))
 
 		if err := svc.ScanNow(context.Background()); err != nil {
 			t.Fatalf("ScanNow() with chmod 0000 subdir unexpected error: %v", err)
@@ -707,8 +626,8 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 
 		badFile := filepath.Join(musicDir, "01 - ReadErr.wav")
 		removedFile := filepath.Join(musicDir, "02 - Removed.wav")
-		writeMinimalWAV(t, badFile)
-		writeMinimalWAV(t, removedFile)
+		testutil.WriteMinimalWAV(t, badFile)
+		testutil.WriteMinimalWAV(t, removedFile)
 
 		logs, logger := newLogCapture()
 		svc := newTestService(t, musicDir, 0, st, logger)
@@ -720,10 +639,10 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Touch badFile so fast-path does not skip it, and add a healthy new track.
-		writeMinimalWAV(t, badFile)
-		writeTags(t, badFile, map[string][]string{taglib.Title: {"Changed"}})
+		testutil.WriteMinimalWAV(t, badFile)
+		testutil.WriteTags(t, badFile, map[string][]string{taglib.Title: {"Changed"}})
 		healthyNew := filepath.Join(musicDir, "03 - Healthy.wav")
-		writeMinimalWAV(t, healthyNew)
+		testutil.WriteMinimalWAV(t, healthyNew)
 
 		svc.extractFn = func(path string) (metadata.Info, error) {
 			if path == badFile {
@@ -751,8 +670,8 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 
 		keepFile := filepath.Join(musicDir, "01 - Keep.wav")
 		vanishingFile := filepath.Join(musicDir, "02 - Vanish.wav")
-		writeMinimalWAV(t, keepFile)
-		writeMinimalWAV(t, vanishingFile)
+		testutil.WriteMinimalWAV(t, keepFile)
+		testutil.WriteMinimalWAV(t, vanishingFile)
 
 		logs, logger := newLogCapture()
 		svc := newTestService(t, musicDir, 0, st, logger)
@@ -761,7 +680,7 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 		}
 
 		// Modify vanishingFile so extractFn is invoked, then delete it during extractFn.
-		writeTags(t, vanishingFile, map[string][]string{taglib.Title: {"Modified Before Vanish"}})
+		testutil.WriteTags(t, vanishingFile, map[string][]string{taglib.Title: {"Modified Before Vanish"}})
 		svc.extractFn = func(path string) (metadata.Info, error) {
 			if path == vanishingFile {
 				_ = os.Remove(vanishingFile)
@@ -784,7 +703,7 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 	t.Run("missing or non-directory root returns error without mutating DB or LastScan", func(t *testing.T) {
 		st := openTestStore(t)
 		musicDir := t.TempDir()
-		writeMinimalWAV(t, filepath.Join(musicDir, "01 - Track.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "01 - Track.wav"))
 
 		svc := newTestService(t, musicDir, 0, st, nil)
 		if err := svc.ScanNow(context.Background()); err != nil {
@@ -801,7 +720,7 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 
 		// Also verify non-directory path returns error.
 		fileRoot := filepath.Join(t.TempDir(), "not-a-dir")
-		writeBytes(t, fileRoot, []byte("file"))
+		testutil.WriteBytes(t, fileRoot, []byte("file"))
 		svcFile := newTestService(t, fileRoot, 0, st, nil)
 		if err := svcFile.ScanNow(context.Background()); err == nil {
 			t.Fatalf("ScanNow() on non-directory root succeeded, want error")
@@ -816,7 +735,7 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 	t.Run("pre-canceled and mid-walk canceled ctx abort without mutating DB or LastScan", func(t *testing.T) {
 		st := openTestStore(t)
 		musicDir := t.TempDir()
-		writeMinimalWAV(t, filepath.Join(musicDir, "01 - Seed.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "01 - Seed.wav"))
 
 		svc := newTestService(t, musicDir, 0, st, nil)
 		if err := svc.ScanNow(context.Background()); err != nil {
@@ -825,7 +744,7 @@ func TestScanNow_SafetyGuards(t *testing.T) {
 		before := svc.Status()
 
 		// 1. Pre-canceled context fails immediately without scanning new files.
-		writeMinimalWAV(t, filepath.Join(musicDir, "02 - Unscanned.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "02 - Unscanned.wav"))
 		preCanceledCtx, preCancel := context.WithCancel(context.Background())
 		preCancel()
 		if err := svc.ScanNow(preCanceledCtx); !errors.Is(err, context.Canceled) {
@@ -899,7 +818,7 @@ func TestWatcher_LiveLifecycle(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(nestedFile), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeMinimalWAV(t, nestedFile)
+	testutil.WriteMinimalWAV(t, nestedFile)
 	waitForCondition(t, testWaitTimeout, "nested track indexed", func() bool {
 		_, ok := loadSnapshotsMap(t, st)["a/b/01 - Nested.wav"]
 		return ok && svc.Status().Count == 1
@@ -914,18 +833,18 @@ func TestWatcher_LiveLifecycle(t *testing.T) {
 	// 3. Atomic .tmp write, ignored names/dirs, and in-tree symlinks are ignored until renamed to .mp3.
 	tmpFile := filepath.Join(musicDir, "02 - Atomic.mp3.tmp")
 	finalMP3 := filepath.Join(musicDir, "02 - Atomic.mp3")
-	writeMinimalMP3(t, tmpFile)
-	writeTags(t, tmpFile, map[string][]string{taglib.Title: {"Atomic Title"}})
-	writeMinimalMP3(t, filepath.Join(musicDir, "._Ignored.mp3"))
-	writeMinimalWAV(t, filepath.Join(musicDir, ".hidden", "ignored.wav"))
+	testutil.WriteMinimalMP3(t, tmpFile)
+	testutil.WriteTags(t, tmpFile, map[string][]string{taglib.Title: {"Atomic Title"}})
+	testutil.WriteMinimalMP3(t, filepath.Join(musicDir, "._Ignored.mp3"))
+	testutil.WriteMinimalWAV(t, filepath.Join(musicDir, ".hidden", "ignored.wav"))
 
 	outsideFile := filepath.Join(t.TempDir(), "outside.wav")
-	writeMinimalWAV(t, outsideFile)
+	testutil.WriteMinimalWAV(t, outsideFile)
 	if err := os.Symlink(outsideFile, filepath.Join(musicDir, "linked-file.wav")); err != nil {
 		t.Fatalf("os.Symlink(file): %v", err)
 	}
 	outsideDir := t.TempDir()
-	writeMinimalWAV(t, filepath.Join(outsideDir, "outside.wav"))
+	testutil.WriteMinimalWAV(t, filepath.Join(outsideDir, "outside.wav"))
 	if err := os.Symlink(outsideDir, filepath.Join(musicDir, "linked-dir")); err != nil {
 		t.Fatalf("os.Symlink(dir): %v", err)
 	}
@@ -961,7 +880,7 @@ func TestWatcher_LiveLifecycle(t *testing.T) {
 
 	// 4. In-place edit preserves ID and CreatedAt.
 	origMP3 := mustGetTrackByRelPath(t, st, "02 - Atomic.mp3")
-	writeTags(t, finalMP3, map[string][]string{taglib.Title: {"Atomic Title Edited"}})
+	testutil.WriteTags(t, finalMP3, map[string][]string{taglib.Title: {"Atomic Title Edited"}})
 	waitForCondition(t, testWaitTimeout, "in-place edit reflected in store", func() bool {
 		return mustGetTrackByRelPath(t, st, "02 - Atomic.mp3").Title == "Atomic Title Edited"
 	})
@@ -974,7 +893,7 @@ func TestWatcher_LiveLifecycle(t *testing.T) {
 	// 5. Audio-named directory created and removed (renamed out of tree -> DeleteByDirPrefix).
 	audioNamedDir := filepath.Join(musicDir, "AudioNamedDir.mp3")
 	audioNamedChild := filepath.Join(audioNamedDir, "01 - Track.wav")
-	writeMinimalWAV(t, audioNamedChild)
+	testutil.WriteMinimalWAV(t, audioNamedChild)
 	waitForCondition(t, testWaitTimeout, "audio-named dir child indexed", func() bool {
 		snaps := loadSnapshotsMap(t, st)
 		_, childOK := snaps["AudioNamedDir.mp3/01 - Track.wav"]
@@ -1035,7 +954,7 @@ func TestWatcher_PartialWriteStability(t *testing.T) {
 		svc.debounceDelay = 30 * time.Millisecond
 		svc.stabilityDelay = 15 * time.Millisecond
 
-		fullWAV := minimalWAVBytes()
+		fullWAV := testutil.MinimalWAVBytes()
 		chunk1End := 44 + 8000
 		chunk2End := 44 + 20000
 
@@ -1067,7 +986,7 @@ func TestWatcher_PartialWriteStability(t *testing.T) {
 		startAndWaitReady(t, svc)
 
 		growingPath := filepath.Join(musicDir, "growing.wav")
-		writeBytes(t, growingPath, fullWAV[:chunk1End])
+		testutil.WriteBytes(t, growingPath, fullWAV[:chunk1End])
 
 		waitForCondition(t, testWaitTimeout, "growing file indexed once stable", func() bool {
 			snap, ok := loadSnapshotsMap(t, st)["growing.wav"]
@@ -1095,7 +1014,7 @@ func TestWatcher_PartialWriteStability(t *testing.T) {
 		startAndWaitReady(t, svc)
 
 		zeroPath := filepath.Join(musicDir, "01 - Zero.wav")
-		writeBytes(t, zeroPath, nil)
+		testutil.WriteBytes(t, zeroPath, nil)
 
 		waitForCondition(t, testWaitTimeout, "zero-byte file hits maxStabilityAttempts", func() bool {
 			return logs.countWarningsContaining("did not stabilize") >= 1
@@ -1105,10 +1024,10 @@ func TestWatcher_PartialWriteStability(t *testing.T) {
 		}
 
 		// Writing valid WAV bytes fires a fresh Write event resetting attempts to 0.
-		writeMinimalWAV(t, zeroPath)
+		testutil.WriteMinimalWAV(t, zeroPath)
 		waitForCondition(t, testWaitTimeout, "zero-byte file indexed after valid WAV write", func() bool {
 			snap, ok := loadSnapshotsMap(t, st)["01 - Zero.wav"]
-			return ok && snap.FileSize == int64(len(minimalWAVBytes())) && svc.Status().Count == 1
+			return ok && snap.FileSize == int64(len(testutil.MinimalWAVBytes())) && svc.Status().Count == 1
 		})
 	})
 
@@ -1119,8 +1038,8 @@ func TestWatcher_PartialWriteStability(t *testing.T) {
 
 		staged := filepath.Join(musicDir, "01 - Mutate.wav.tmp")
 		target := filepath.Join(musicDir, "01 - Mutate.wav")
-		writeMinimalWAV(t, staged)
-		writeTags(t, staged, map[string][]string{taglib.Title: {"Before Mutation"}})
+		testutil.WriteMinimalWAV(t, staged)
+		testutil.WriteTags(t, staged, map[string][]string{taglib.Title: {"Before Mutation"}})
 
 		firstIngestDone := make(chan struct{})
 		var firstIngestOnce sync.Once
@@ -1218,7 +1137,7 @@ func TestWatcher_PartialWriteStability(t *testing.T) {
 
 		startAndWaitReady(t, svc)
 
-		writeMinimalWAV(t, filepath.Join(musicDir, "01 - Vanish.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "01 - Vanish.wav"))
 
 		timer := time.NewTimer(testWaitTimeout)
 		defer timer.Stop()
@@ -1252,8 +1171,8 @@ func TestWatcher_NestedDirectoryRename(t *testing.T) {
 		dirA := filepath.Join(musicDir, "dirA")
 		dirASub := filepath.Join(dirA, "sub")
 		dirAB := filepath.Join(musicDir, "dirAB")
-		writeMinimalWAV(t, filepath.Join(dirASub, "track.wav"))
-		writeMinimalWAV(t, filepath.Join(dirAB, "keep.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirASub, "track.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirAB, "keep.wav"))
 
 		svc := newTestService(t, musicDir, 0, st, nil)
 		startAndWaitReady(t, svc)
@@ -1293,7 +1212,7 @@ func TestWatcher_NestedDirectoryRename(t *testing.T) {
 		})
 
 		// New file written inside renamed nested directory is watched live.
-		writeMinimalWAV(t, filepath.Join(dirB, "sub", "new.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirB, "sub", "new.wav"))
 		waitForCondition(t, testWaitTimeout, "new file under dirB/sub indexed live", func() bool {
 			_, ok := loadSnapshotsMap(t, st)["dirB/sub/new.wav"]
 			return ok && svc.Status().Count == 3
@@ -1313,7 +1232,7 @@ func TestWatcher_NestedDirectoryRename(t *testing.T) {
 		if err := os.MkdirAll(dirA, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		writeMinimalWAV(t, filepath.Join(dirB, "seed.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirB, "seed.wav"))
 
 		svc := newTestService(t, musicDir, 0, st, nil)
 		startAndWaitReady(t, svc)
@@ -1349,7 +1268,7 @@ func TestWatcher_NestedDirectoryRename(t *testing.T) {
 				slices.Contains(wl, dirAWatch)
 		})
 
-		writeMinimalWAV(t, filepath.Join(dirA, "after-replace.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirA, "after-replace.wav"))
 		waitForCondition(t, testWaitTimeout, "new file in replaced dirA indexed live", func() bool {
 			_, ok := loadSnapshotsMap(t, st)["dirA/after-replace.wav"]
 			return ok && svc.Status().Count == 2
@@ -1367,7 +1286,7 @@ func TestWatcher_OverflowReconcile(t *testing.T) {
 		}
 
 		oldDir := filepath.Join(musicDir, "olddir")
-		writeMinimalWAV(t, filepath.Join(oldDir, "old.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(oldDir, "old.wav"))
 
 		svc := newTestService(t, musicDir, 0, st, nil)
 		svc.maxEventQueue = 2
@@ -1406,10 +1325,10 @@ func TestWatcher_OverflowReconcile(t *testing.T) {
 		// plus writes directly in the already-watched root so inotify overflows maxEventQueue=2.
 		newDir := filepath.Join(musicDir, "newdir")
 		for _, name := range []string{"a.wav", "b.wav", "c.wav", "d.wav"} {
-			writeMinimalWAV(t, filepath.Join(newDir, name))
+			testutil.WriteMinimalWAV(t, filepath.Join(newDir, name))
 		}
 		for i := range 5 {
-			writeBytes(t, filepath.Join(musicDir, fmt.Sprintf("burst-%d.txt", i)), []byte("overflow"))
+			testutil.WriteBytes(t, filepath.Join(musicDir, fmt.Sprintf("burst-%d.txt", i)), []byte("overflow"))
 		}
 
 		waitForCondition(t, testWaitTimeout, "events queue overflow triggered rescan", func() bool {
@@ -1435,7 +1354,7 @@ func TestWatcher_OverflowReconcile(t *testing.T) {
 		})
 
 		// Subsequent live events keep working.
-		writeMinimalWAV(t, filepath.Join(newDir, "live.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(newDir, "live.wav"))
 		waitForCondition(t, testWaitTimeout, "live event after overflow indexed", func() bool {
 			_, ok := loadSnapshotsMap(t, st)["newdir/live.wav"]
 			return ok && svc.Status().Count == 5
@@ -1445,7 +1364,7 @@ func TestWatcher_OverflowReconcile(t *testing.T) {
 	t.Run("fsnotify.ErrEventOverflow injection reconciles and continues watching", func(t *testing.T) {
 		st := openTestStore(t)
 		musicDir := t.TempDir()
-		writeMinimalWAV(t, filepath.Join(musicDir, "01 - Initial.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "01 - Initial.wav"))
 
 		logs, logger := newLogCapture()
 		svc := newTestService(t, musicDir, 0, st, logger)
@@ -1476,7 +1395,7 @@ func TestWatcher_OverflowReconcile(t *testing.T) {
 			return logs.countWarningsContaining("overflow") >= 1 && svc.Status().LastScan.After(beforeScan)
 		})
 
-		writeMinimalWAV(t, filepath.Join(musicDir, "after-overflow", "02 - Live.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "after-overflow", "02 - Live.wav"))
 		waitForCondition(t, testWaitTimeout, "live event after ErrEventOverflow indexed", func() bool {
 			_, ok := loadSnapshotsMap(t, st)["after-overflow/02 - Live.wav"]
 			return ok && svc.Status().Count == 2
@@ -1493,7 +1412,7 @@ func TestWatcher_OverflowReconcile(t *testing.T) {
 
 		dirA := filepath.Join(musicDir, "dirA")
 		dirB := filepath.Join(musicDir, "dirB")
-		writeMinimalWAV(t, filepath.Join(dirA, "sub", "orig.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirA, "sub", "orig.wav"))
 
 		svc := newTestService(t, musicDir, 0, st, nil)
 		svc.maxEventQueue = 2
@@ -1521,15 +1440,15 @@ func TestWatcher_OverflowReconcile(t *testing.T) {
 		t.Cleanup(closeRelease)
 
 		// Pause dispatchLoop, then rename dirA -> dirB and recreate dirA/sub during queue overflow.
-		writeMinimalWAV(t, filepath.Join(musicDir, "trigger.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "trigger.wav"))
 		waitForChan(t, dispatchedFirst, testWaitTimeout, "dispatchedFirst")
 
 		if err := os.Rename(dirA, dirB); err != nil {
 			t.Fatalf("os.Rename(%q, %q): %v", dirA, dirB, err)
 		}
-		writeMinimalWAV(t, filepath.Join(dirA, "sub", "recreated.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirA, "sub", "recreated.wav"))
 		for i := range 5 {
-			writeBytes(t, filepath.Join(musicDir, fmt.Sprintf("burst-%d.txt", i)), []byte("overflow"))
+			testutil.WriteBytes(t, filepath.Join(musicDir, fmt.Sprintf("burst-%d.txt", i)), []byte("overflow"))
 		}
 
 		waitForCondition(t, testWaitTimeout, "overflow rescan triggered during rename-and-recreate", func() bool {
@@ -1561,8 +1480,8 @@ func TestWatcher_OverflowReconcile(t *testing.T) {
 		})
 
 		// Verify live watches work in BOTH recreated dirA/sub and moved dirB/sub.
-		writeMinimalWAV(t, filepath.Join(dirA, "sub", "live-a.wav"))
-		writeMinimalWAV(t, filepath.Join(dirB, "sub", "live-b.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirA, "sub", "live-a.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(dirB, "sub", "live-b.wav"))
 		waitForCondition(t, testWaitTimeout, "live events in both dirA/sub and dirB/sub indexed", func() bool {
 			snaps := loadSnapshotsMap(t, st)
 			_, liveA := snaps["dirA/sub/live-a.wav"]
@@ -1576,7 +1495,7 @@ func TestWatcher_LimitDegradation(t *testing.T) {
 	t.Run("newWatcherFn EMFILE logs once and falls back to periodic polling", func(t *testing.T) {
 		st := openTestStore(t)
 		musicDir := t.TempDir()
-		writeMinimalWAV(t, filepath.Join(musicDir, "01 - Seed.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "01 - Seed.wav"))
 
 		logs, logger := newLogCapture()
 		svc := newTestService(t, musicDir, 25*time.Millisecond, st, logger)
@@ -1593,7 +1512,7 @@ func TestWatcher_LimitDegradation(t *testing.T) {
 			t.Errorf("limit WARN count = %d, want 1\nlogs:\n%s", got, logs.allText())
 		}
 
-		writeMinimalWAV(t, filepath.Join(musicDir, "02 - Polled.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "02 - Polled.wav"))
 		waitForCondition(t, testWaitTimeout, "periodic polling indexes new track on EMFILE fallback", func() bool {
 			_, ok := loadSnapshotsMap(t, st)["02 - Polled.wav"]
 			return ok && svc.Status().Count == 2
@@ -1606,9 +1525,9 @@ func TestWatcher_LimitDegradation(t *testing.T) {
 	t.Run("addWatchFn ENOSPC across multiple subdirs logs once and falls back to periodic polling", func(t *testing.T) {
 		st := openTestStore(t)
 		musicDir := t.TempDir()
-		writeMinimalWAV(t, filepath.Join(musicDir, "sub1", "01 - One.wav"))
-		writeMinimalWAV(t, filepath.Join(musicDir, "sub2", "02 - Two.wav"))
-		writeMinimalWAV(t, filepath.Join(musicDir, "sub3", "03 - Three.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "sub1", "01 - One.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "sub2", "02 - Two.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "sub3", "03 - Three.wav"))
 
 		logs, logger := newLogCapture()
 		svc := newTestService(t, musicDir, 25*time.Millisecond, st, logger)
@@ -1625,7 +1544,7 @@ func TestWatcher_LimitDegradation(t *testing.T) {
 			t.Errorf("limit WARN count across subdirs = %d, want 1\nlogs:\n%s", got, logs.allText())
 		}
 
-		writeMinimalWAV(t, filepath.Join(musicDir, "sub2", "04 - Polled.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "sub2", "04 - Polled.wav"))
 		waitForCondition(t, testWaitTimeout, "periodic polling indexes new track on ENOSPC fallback", func() bool {
 			_, ok := loadSnapshotsMap(t, st)["sub2/04 - Polled.wav"]
 			return ok && svc.Status().Count == 4
@@ -1639,7 +1558,7 @@ func TestWatcher_LimitDegradation(t *testing.T) {
 func TestService_ConcurrentScanAndWatcher(t *testing.T) {
 	st := openTestStore(t)
 	musicDir := t.TempDir()
-	writeMinimalWAV(t, filepath.Join(musicDir, "base", "00 - Anchor.wav"))
+	testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "base", "00 - Anchor.wav"))
 
 	svc := newTestService(t, musicDir, 30*time.Millisecond, st, nil)
 	svc.debounceDelay = 15 * time.Millisecond
@@ -1662,7 +1581,7 @@ func TestService_ConcurrentScanAndWatcher(t *testing.T) {
 			writerErrs <- err
 			return
 		}
-		wavData := minimalWAVBytes()
+		wavData := testutil.MinimalWAVBytes()
 		for i := range 15 {
 			tmpPath := filepath.Join(dir, fmt.Sprintf("track-%d.wav.tmp", i))
 			finalPath := filepath.Join(dir, fmt.Sprintf("track-%d.wav", i))
@@ -1766,9 +1685,9 @@ func TestService_StartupCountAndCleanShutdown(t *testing.T) {
 		p1 := filepath.Join(musicDir, "01 - SeedOne.wav")
 		p2 := filepath.Join(musicDir, "02 - SeedTwo.wav")
 		p3 := filepath.Join(musicDir, "03 - PendingInitial.wav")
-		writeMinimalWAV(t, p1)
-		writeMinimalWAV(t, p2)
-		writeMinimalWAV(t, p3)
+		testutil.WriteMinimalWAV(t, p1)
+		testutil.WriteMinimalWAV(t, p2)
+		testutil.WriteMinimalWAV(t, p3)
 
 		for _, p := range []string{p1, p2} {
 			info, err := os.Stat(p)
@@ -1867,7 +1786,7 @@ func TestService_StartupCountAndCleanShutdown(t *testing.T) {
 		}
 
 		// Trigger a pending debounce timer, wait until registered, then cancel and Wait cleanly.
-		writeMinimalWAV(t, filepath.Join(musicDir, "04 - MidDebounce.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "04 - MidDebounce.wav"))
 		waitForCondition(t, testWaitTimeout, "debounce timer pending before shutdown", func() bool {
 			return svc.pendingCount() >= 1
 		})
@@ -1929,7 +1848,7 @@ func TestService_StartupCountAndCleanShutdown(t *testing.T) {
 			t.Errorf("Status() while musicDir missing = %+v, want Count=0 and zero LastScan", got)
 		}
 
-		writeMinimalWAV(t, filepath.Join(musicDir, "01 - MountedLater.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "01 - MountedLater.wav"))
 		waitForCondition(t, testWaitTimeout, "periodic polling recovers when musicDir appears", func() bool {
 			_, ok := loadSnapshotsMap(t, st)["01 - MountedLater.wav"]
 			return ok && svc.Status().Count == 1 && !svc.Status().LastScan.IsZero()
@@ -1967,7 +1886,7 @@ func TestService_StartupCountAndCleanShutdown(t *testing.T) {
 		}
 
 		_, cancel := startAndWaitReady(t, svc)
-		writeMinimalWAV(t, filepath.Join(musicDir, "01 - MidStability.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "01 - MidStability.wav"))
 		waitForChan(t, stabilityEntered, testWaitTimeout, "stabilityEntered")
 
 		cancel()
