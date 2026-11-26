@@ -4,16 +4,23 @@ package subsonic
 import "encoding/xml"
 
 const (
-	apiVersion       = "1.16.1"
-	serverType       = "headunit"
-	serverVersion    = "0.1.0"
-	xmlNamespace     = "http://subsonic.org/restapi"
-	statusOK         = "ok"
-	statusFailed     = "failed"
-	defaultUsername  = "headunit"
-	errCodeGeneric   = 0
-	errCodeNotFound  = 70
-	maxFormBodyBytes = 1 << 20 // 1 MiB
+	apiVersion           = "1.16.1"
+	serverType           = "headunit"
+	serverVersion        = "0.1.0"
+	xmlNamespace         = "http://subsonic.org/restapi"
+	statusOK             = "ok"
+	statusFailed         = "failed"
+	defaultUsername      = "headunit"
+	errCodeGeneric       = 0
+	errCodeMissingParam  = 10
+	errCodeNotFound      = 70
+	maxFormBodyBytes     = 1 << 20 // 1 MiB
+	musicFolderID        = 1
+	musicFolderName      = "Music"
+	ignoredArticles      = "The El La Los Las Le Les"
+	defaultAlbumListSize = 10
+	defaultSearch3Count  = 20
+	mediaTypeMusic       = "music"
 )
 
 type jsonEnvelope struct {
@@ -52,6 +59,20 @@ type Response struct {
 	Genres *Genres `xml:"genres,omitempty" json:"genres,omitempty"`
 	// Starred2 carries the getStarred2 stub payload.
 	Starred2 *Starred2 `xml:"starred2,omitempty" json:"starred2,omitempty"`
+	// MusicFolders carries the getMusicFolders payload.
+	MusicFolders *MusicFolders `xml:"musicFolders,omitempty" json:"musicFolders,omitempty"`
+	// Artists carries the getArtists ID3 index payload.
+	Artists *ArtistsID3 `xml:"artists,omitempty" json:"artists,omitempty"`
+	// Artist carries the getArtist payload.
+	Artist *ArtistWithAlbumsID3 `xml:"artist,omitempty" json:"artist,omitempty"`
+	// Album carries the getAlbum payload.
+	Album *AlbumWithSongsID3 `xml:"album,omitempty" json:"album,omitempty"`
+	// AlbumList2 carries the getAlbumList2 payload.
+	AlbumList2 *AlbumList2 `xml:"albumList2,omitempty" json:"albumList2,omitempty"`
+	// Song carries the getSong payload.
+	Song *Child `xml:"song,omitempty" json:"song,omitempty"`
+	// SearchResult3 carries the search3 payload.
+	SearchResult3 *SearchResult3 `xml:"searchResult3,omitempty" json:"searchResult3,omitempty"`
 }
 
 // APIError represents a Subsonic/OpenSubsonic application error element.
@@ -147,4 +168,171 @@ type Starred2 struct {
 	Album []struct{} `xml:"album" json:"album"`
 	// Song holds starred songs.
 	Song []struct{} `xml:"song" json:"song"`
+}
+
+// MusicFolders represents the getMusicFolders payload.
+// Callers must initialize MusicFolder to a non-nil slice so JSON emits [].
+type MusicFolders struct {
+	// MusicFolder lists the virtual music folders exposed by Headunit.
+	MusicFolder []MusicFolder `xml:"musicFolder" json:"musicFolder"`
+}
+
+// MusicFolder describes a single top-level virtual music folder.
+type MusicFolder struct {
+	// ID is the numeric music folder identifier (never omitted even if zero).
+	ID int `xml:"id,attr" json:"id"`
+	// Name is the human-readable display name of the music folder.
+	Name string `xml:"name,attr" json:"name"`
+}
+
+// ArtistsID3 represents the getArtists ID3 artist index payload.
+// Callers must initialize Index to a non-nil slice so JSON emits [].
+type ArtistsID3 struct {
+	// IgnoredArticles lists space-delimited leading articles stripped when sorting.
+	IgnoredArticles string `xml:"ignoredArticles,attr" json:"ignoredArticles"`
+	// Index holds non-empty alphabetical artist buckets ("A"-"Z", followed by "#").
+	Index []IndexID3 `xml:"index" json:"index"`
+}
+
+// IndexID3 groups ID3 artists sharing a single index bucket.
+type IndexID3 struct {
+	// Name is the single-character index heading ("A"-"Z" or "#").
+	Name string `xml:"name,attr" json:"name"`
+	// Artist lists the artists sorted within this index bucket.
+	Artist []ArtistID3 `xml:"artist" json:"artist"`
+}
+
+// ArtistID3 represents an ID3 artist summary without nested albums.
+type ArtistID3 struct {
+	// ID is the deterministic artist identifier ("ar_" prefix).
+	ID string `xml:"id,attr" json:"id"`
+	// Name is the canonical album artist display name.
+	Name string `xml:"name,attr" json:"name"`
+	// AlbumCount is the number of distinct albums under this artist.
+	AlbumCount int `xml:"albumCount,attr" json:"albumCount"`
+}
+
+// ArtistWithAlbumsID3 represents the getArtist payload containing an artist
+// and all of their albums. Callers must initialize Album to a non-nil slice.
+type ArtistWithAlbumsID3 struct {
+	// ID is the deterministic artist identifier ("ar_" prefix).
+	ID string `xml:"id,attr" json:"id"`
+	// Name is the canonical album artist display name.
+	Name string `xml:"name,attr" json:"name"`
+	// AlbumCount is the number of distinct albums under this artist.
+	AlbumCount int `xml:"albumCount,attr" json:"albumCount"`
+	// Album lists the artist's albums ordered deterministically.
+	Album []AlbumID3 `xml:"album" json:"album"`
+}
+
+// AlbumID3 represents an ID3 album summary.
+type AlbumID3 struct {
+	// ID is the deterministic album identifier ("al_" prefix).
+	ID string `xml:"id,attr" json:"id"`
+	// Name is the canonical album title.
+	Name string `xml:"name,attr" json:"name"`
+	// Artist is the canonical album artist name.
+	Artist string `xml:"artist,attr" json:"artist"`
+	// ArtistID is the deterministic identifier for the album artist.
+	ArtistID string `xml:"artistId,attr" json:"artistId"`
+	// SongCount is the number of tracks in the album.
+	SongCount int `xml:"songCount,attr" json:"songCount"`
+	// Duration is the total album duration in whole seconds.
+	Duration int `xml:"duration,attr" json:"duration"`
+	// Created is the earliest UTC RFC3339 timestamp among tracks in the album.
+	Created string `xml:"created,attr,omitempty" json:"created,omitempty"`
+	// Year is the album release year, omitted when zero.
+	Year int `xml:"year,attr,omitempty" json:"year,omitempty"`
+	// Genre is the album genre, omitted when empty.
+	Genre string `xml:"genre,attr,omitempty" json:"genre,omitempty"`
+}
+
+// AlbumWithSongsID3 represents the getAlbum payload containing an album and
+// its ordered tracks. Callers must initialize Song to a non-nil slice.
+type AlbumWithSongsID3 struct {
+	// ID is the deterministic album identifier ("al_" prefix).
+	ID string `xml:"id,attr" json:"id"`
+	// Name is the canonical album title.
+	Name string `xml:"name,attr" json:"name"`
+	// Artist is the canonical album artist name.
+	Artist string `xml:"artist,attr" json:"artist"`
+	// ArtistID is the deterministic identifier for the album artist.
+	ArtistID string `xml:"artistId,attr" json:"artistId"`
+	// SongCount is the number of tracks in the album.
+	SongCount int `xml:"songCount,attr" json:"songCount"`
+	// Duration is the total album duration in whole seconds.
+	Duration int `xml:"duration,attr" json:"duration"`
+	// Created is the earliest UTC RFC3339 timestamp among tracks in the album.
+	Created string `xml:"created,attr,omitempty" json:"created,omitempty"`
+	// Year is the album release year, omitted when zero.
+	Year int `xml:"year,attr,omitempty" json:"year,omitempty"`
+	// Genre is the album genre, omitted when empty.
+	Genre string `xml:"genre,attr,omitempty" json:"genre,omitempty"`
+	// Song lists the album's tracks ordered by disc, track number, title, and ID.
+	Song []Child `xml:"song" json:"song"`
+}
+
+// AlbumList2 represents the getAlbumList2 payload.
+// Callers must initialize Album to a non-nil slice so JSON emits [].
+type AlbumList2 struct {
+	// Album lists the paginated album summaries matching the requested sort.
+	Album []AlbumID3 `xml:"album" json:"album"`
+}
+
+// Child represents a Subsonic v1.16.1 song entity across getAlbum, getSong, and
+// search3 responses, matching the 21 standard MVP fields.
+type Child struct {
+	// ID is the stable track identifier ("tr_" prefix).
+	ID string `xml:"id,attr" json:"id"`
+	// Parent links the track to its parent ID3 album ID.
+	Parent string `xml:"parent,attr" json:"parent"`
+	// IsDir indicates whether the entry is a directory (always false for songs).
+	IsDir bool `xml:"isDir,attr" json:"isDir"`
+	// Title is the track title.
+	Title string `xml:"title,attr" json:"title"`
+	// Album is the album title.
+	Album string `xml:"album,attr" json:"album"`
+	// Artist is the track-level artist name.
+	Artist string `xml:"artist,attr" json:"artist"`
+	// Track is the 1-based track number, omitted when zero.
+	Track int `xml:"track,attr,omitempty" json:"track,omitempty"`
+	// Year is the 4-digit release year, omitted when zero.
+	Year int `xml:"year,attr,omitempty" json:"year,omitempty"`
+	// Genre is the track genre, omitted when empty.
+	Genre string `xml:"genre,attr,omitempty" json:"genre,omitempty"`
+	// Size is the audio file size in bytes.
+	Size int64 `xml:"size,attr" json:"size"`
+	// ContentType is the HTTP MIME type used when streaming the track.
+	ContentType string `xml:"contentType,attr" json:"contentType"`
+	// Suffix is the lowercase file extension without leading dot, omitted only if empty.
+	Suffix string `xml:"suffix,attr,omitempty" json:"suffix,omitempty"`
+	// Duration is the audio duration in whole seconds.
+	Duration int `xml:"duration,attr" json:"duration"`
+	// BitRate is the audio bitrate in kbps, omitted when zero.
+	BitRate int `xml:"bitRate,attr,omitempty" json:"bitRate,omitempty"`
+	// Path is the forward-slash path relative to the music root.
+	Path string `xml:"path,attr" json:"path"`
+	// IsVideo indicates whether the entry is a video (always false for audio).
+	IsVideo bool `xml:"isVideo,attr" json:"isVideo"`
+	// DiscNumber is the 1-based disc number, omitted when zero.
+	DiscNumber int `xml:"discNumber,attr,omitempty" json:"discNumber,omitempty"`
+	// Created is the UTC RFC3339 timestamp when the track was first indexed.
+	Created string `xml:"created,attr,omitempty" json:"created,omitempty"`
+	// AlbumID is the deterministic parent album identifier.
+	AlbumID string `xml:"albumId,attr" json:"albumId"`
+	// ArtistID is the deterministic album artist identifier.
+	ArtistID string `xml:"artistId,attr" json:"artistId"`
+	// Type identifies the Subsonic media type ("music").
+	Type string `xml:"type,attr" json:"type"`
+}
+
+// SearchResult3 represents the search3 payload.
+// Callers must initialize Artist, Album, and Song to non-nil slices so JSON emits [].
+type SearchResult3 struct {
+	// Artist holds matching ID3 artists.
+	Artist []ArtistID3 `xml:"artist" json:"artist"`
+	// Album holds matching ID3 albums.
+	Album []AlbumID3 `xml:"album" json:"album"`
+	// Song holds matching tracks.
+	Song []Child `xml:"song" json:"song"`
 }
