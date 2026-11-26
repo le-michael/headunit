@@ -3,6 +3,7 @@ module headunit
 go 1.26.0
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1
 	go.senan.xyz/taglib v0.15.0
 	modernc.org/sqlite v1.63.0
 )

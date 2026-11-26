@@ -1,7 +1,6 @@
 package metadata
 
 import (
-	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,102 +9,9 @@ import (
 	"time"
 
 	"go.senan.xyz/taglib"
+
+	"headunit/internal/testutil"
 )
-
-// writeMinimalWAV writes a valid 2-second, 128 kbps (8000 Hz, 16-bit mono PCM)
-// RIFF/WAVE file to path.
-func writeMinimalWAV(t *testing.T, path string) {
-	t.Helper()
-
-	const (
-		channels      uint16 = 1
-		sampleRate    uint32 = 8000
-		bitsPerSample uint16 = 16
-		blockAlign           = channels * bitsPerSample / 8
-		byteRate             = sampleRate * uint32(blockAlign)
-		dataSize      uint32 = byteRate * 2 // 32,000 bytes = 2 seconds
-	)
-
-	buf := make([]byte, 44+dataSize)
-	copy(buf[0:4], "RIFF")
-	binary.LittleEndian.PutUint32(buf[4:8], 36+dataSize)
-	copy(buf[8:12], "WAVE")
-	copy(buf[12:16], "fmt ")
-	binary.LittleEndian.PutUint32(buf[16:20], 16)
-	binary.LittleEndian.PutUint16(buf[20:22], 1) // PCM
-	binary.LittleEndian.PutUint16(buf[22:24], channels)
-	binary.LittleEndian.PutUint32(buf[24:28], sampleRate)
-	binary.LittleEndian.PutUint32(buf[28:32], byteRate)
-	binary.LittleEndian.PutUint16(buf[32:34], blockAlign)
-	binary.LittleEndian.PutUint16(buf[34:36], bitsPerSample)
-	copy(buf[36:40], "data")
-	binary.LittleEndian.PutUint32(buf[40:44], dataSize)
-
-	if err := os.WriteFile(path, buf, 0o600); err != nil {
-		t.Fatalf("writeMinimalWAV(%q): %v", path, err)
-	}
-}
-
-// writeMinimalMP3 writes 77 MPEG-1 Layer III CBR frames (44100 Hz, 128 kbps,
-// 417 bytes/frame), producing ~2.01 seconds of valid MP3 audio.
-func writeMinimalMP3(t *testing.T, path string) {
-	t.Helper()
-
-	const (
-		frameSize  = 417
-		frameCount = 77
-	)
-
-	buf := make([]byte, frameSize*frameCount)
-	for i := range frameCount {
-		off := i * frameSize
-		buf[off] = 0xFF
-		buf[off+1] = 0xFB
-		buf[off+2] = 0x90
-		buf[off+3] = 0x00
-	}
-
-	if err := os.WriteFile(path, buf, 0o600); err != nil {
-		t.Fatalf("writeMinimalMP3(%q): %v", path, err)
-	}
-}
-
-// writeMinimalFLAC writes a minimal valid FLAC file with a STREAMINFO block
-// (44100 Hz, stereo, 16-bit, 88,200 samples = 2 seconds) and 16,000 payload bytes.
-func writeMinimalFLAC(t *testing.T, path string) {
-	t.Helper()
-
-	const (
-		sampleRate    uint64 = 44100
-		channels      uint64 = 2
-		bitsPerSample uint64 = 16
-		totalSamples  uint64 = 88200 // 2s at 44100 Hz
-		payloadSize          = 16000
-	)
-
-	buf := make([]byte, 4+4+34+payloadSize)
-	copy(buf[0:4], "fLaC")
-	buf[4] = 0x80 // last metadata block, type 0 (STREAMINFO)
-	buf[5] = 0x00
-	buf[6] = 0x00
-	buf[7] = 34
-
-	binary.BigEndian.PutUint16(buf[8:10], 4096)  // min block size
-	binary.BigEndian.PutUint16(buf[10:12], 4096) // max block size
-	packed := (sampleRate << 44) | ((channels - 1) << 41) | ((bitsPerSample - 1) << 36) | totalSamples
-	binary.BigEndian.PutUint64(buf[18:26], packed)
-
-	if err := os.WriteFile(path, buf, 0o600); err != nil {
-		t.Fatalf("writeMinimalFLAC(%q): %v", path, err)
-	}
-}
-
-func writeTags(t *testing.T, path string, tags map[string][]string) {
-	t.Helper()
-	if err := taglib.WriteTags(path, tags, taglib.Clear); err != nil {
-		t.Fatalf("taglib.WriteTags(%q): %v", path, err)
-	}
-}
 
 func TestLookupFormat(t *testing.T) {
 	tests := []struct {
@@ -229,8 +135,8 @@ func TestFallbackFromFilename(t *testing.T) {
 func TestExtract_RealFixtures(t *testing.T) {
 	t.Run("tagged MP3 full fields", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "03 - Ignored Filename.mp3")
-		writeMinimalMP3(t, p)
-		writeTags(t, p, map[string][]string{
+		testutil.WriteMinimalMP3(t, p)
+		testutil.WriteTags(t, p, map[string][]string{
 			taglib.Title:       {"Get Lucky"},
 			taglib.Artist:      {"Daft Punk feat. Pharrell Williams"},
 			taglib.AlbumArtist: {"Daft Punk"},
@@ -264,8 +170,8 @@ func TestExtract_RealFixtures(t *testing.T) {
 
 	t.Run("tagged FLAC compilation album artist only", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "01 - Track.flac")
-		writeMinimalFLAC(t, p)
-		writeTags(t, p, map[string][]string{
+		testutil.WriteMinimalFLAC(t, p)
+		testutil.WriteTags(t, p, map[string][]string{
 			taglib.Title:       {"Compilation Track"},
 			taglib.AlbumArtist: {"Various Artists"},
 			taglib.Album:       {"Late Night Mix"},
@@ -288,8 +194,8 @@ func TestExtract_RealFixtures(t *testing.T) {
 
 	t.Run("tagged FLAC artist only fills album artist", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "02 - Blue.flac")
-		writeMinimalFLAC(t, p)
-		writeTags(t, p, map[string][]string{
+		testutil.WriteMinimalFLAC(t, p)
+		testutil.WriteTags(t, p, map[string][]string{
 			taglib.Title:  {"So What"},
 			taglib.Artist: {"Miles Davis"},
 			taglib.Album:  {"Kind of Blue"},
@@ -333,8 +239,8 @@ func TestExtract_RealFixtures(t *testing.T) {
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
 				p := filepath.Join(t.TempDir(), "01 - Year Test.flac")
-				writeMinimalFLAC(t, p)
-				writeTags(t, p, tc.tags)
+				testutil.WriteMinimalFLAC(t, p)
+				testutil.WriteTags(t, p, tc.tags)
 
 				got, err := Extract(p)
 				if err != nil {
@@ -349,8 +255,8 @@ func TestExtract_RealFixtures(t *testing.T) {
 
 	t.Run("tagged FLAC whitespace and malformed tags", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "04 - Clean Fallback.flac")
-		writeMinimalFLAC(t, p)
-		writeTags(t, p, map[string][]string{
+		testutil.WriteMinimalFLAC(t, p)
+		testutil.WriteTags(t, p, map[string][]string{
 			taglib.Title:       {"   "},
 			taglib.Artist:      {"  Trimmed Artist  "},
 			taglib.Album:       {"\t  "},
@@ -386,7 +292,7 @@ func TestExtract_RealFixtures(t *testing.T) {
 
 	t.Run("untagged MP3 retains duration and bitrate", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "01 - Raw Beats.mp3")
-		writeMinimalMP3(t, p)
+		testutil.WriteMinimalMP3(t, p)
 
 		got, err := Extract(p)
 		if err != nil {
@@ -407,7 +313,7 @@ func TestExtract_RealFixtures(t *testing.T) {
 
 	t.Run("untagged FLAC retains duration and bitrate", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "01 - Song Name.flac")
-		writeMinimalFLAC(t, p)
+		testutil.WriteMinimalFLAC(t, p)
 
 		got, err := Extract(p)
 		if err != nil {
@@ -423,7 +329,7 @@ func TestExtract_RealFixtures(t *testing.T) {
 
 	t.Run("untagged WAV retains duration and bitrate", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "01 - Pure Wave.wav")
-		writeMinimalWAV(t, p)
+		testutil.WriteMinimalWAV(t, p)
 
 		got, err := Extract(p)
 		if err != nil {
@@ -444,8 +350,8 @@ func TestExtract_RealFixtures(t *testing.T) {
 
 	t.Run("tagged WAV preserves tags and properties", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "09 - Ignored.wav")
-		writeMinimalWAV(t, p)
-		writeTags(t, p, map[string][]string{
+		testutil.WriteMinimalWAV(t, p)
+		testutil.WriteTags(t, p, map[string][]string{
 			taglib.Title:       {"Studio Master"},
 			taglib.Artist:      {"Wave Artist"},
 			taglib.AlbumArtist: {"Wave Artist"},
@@ -485,8 +391,8 @@ func TestExtract_RealFixtures(t *testing.T) {
 		}
 
 		realMP3 := filepath.Join(targetDir, "source.mp3")
-		writeMinimalMP3(t, realMP3)
-		writeTags(t, realMP3, map[string][]string{
+		testutil.WriteMinimalMP3(t, realMP3)
+		testutil.WriteTags(t, realMP3, map[string][]string{
 			taglib.Title:  {"Linked Song"},
 			taglib.Artist: {"Linked Artist"},
 		})
@@ -504,7 +410,7 @@ func TestExtract_RealFixtures(t *testing.T) {
 		}
 
 		realWAV := filepath.Join(targetDir, "raw.wav")
-		writeMinimalWAV(t, realWAV)
+		testutil.WriteMinimalWAV(t, realWAV)
 		linkWAV := filepath.Join(linkDir, "02 - Link Fallback Name.wav")
 		if err := os.Symlink(realWAV, linkWAV); err != nil {
 			t.Fatalf("os.Symlink(%q, %q): %v", realWAV, linkWAV, err)
@@ -641,7 +547,7 @@ func TestExtract_PartialAndUnexpectedErrors(t *testing.T) {
 
 	t.Run("TOCTOU deletion before real ReadProperties returns ErrNotExist", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "02 - Vanishing.mp3")
-		writeMinimalMP3(t, p)
+		testutil.WriteMinimalMP3(t, p)
 
 		_, err := extract(
 			p,
@@ -808,7 +714,7 @@ func TestExtract_Errors(t *testing.T) {
 			t.Skip("root bypasses file permission checks")
 		}
 		p := filepath.Join(t.TempDir(), "01 - Locked.mp3")
-		writeMinimalMP3(t, p)
+		testutil.WriteMinimalMP3(t, p)
 		if err := os.Chmod(p, 0o000); err != nil {
 			t.Fatalf("os.Chmod(%q, 0o000): %v", p, err)
 		}
@@ -827,23 +733,23 @@ func TestExtract_Concurrent(t *testing.T) {
 	dir := t.TempDir()
 
 	mp3Path := filepath.Join(dir, "01 - MP3.mp3")
-	writeMinimalMP3(t, mp3Path)
-	writeTags(t, mp3Path, map[string][]string{
+	testutil.WriteMinimalMP3(t, mp3Path)
+	testutil.WriteTags(t, mp3Path, map[string][]string{
 		taglib.Title:  {"Concurrent MP3"},
 		taglib.Artist: {"MP3 Artist"},
 		taglib.Album:  {"MP3 Album"},
 	})
 
 	flacPath := filepath.Join(dir, "02 - FLAC.flac")
-	writeMinimalFLAC(t, flacPath)
-	writeTags(t, flacPath, map[string][]string{
+	testutil.WriteMinimalFLAC(t, flacPath)
+	testutil.WriteTags(t, flacPath, map[string][]string{
 		taglib.Title:  {"Concurrent FLAC"},
 		taglib.Artist: {"FLAC Artist"},
 		taglib.Album:  {"FLAC Album"},
 	})
 
 	wavPath := filepath.Join(dir, "03 - Concurrent WAV.wav")
-	writeMinimalWAV(t, wavPath)
+	testutil.WriteMinimalWAV(t, wavPath)
 
 	corruptPath := filepath.Join(dir, "04 - Corrupt.aac")
 	if err := os.WriteFile(corruptPath, []byte("corrupt payload"), 0o600); err != nil {
