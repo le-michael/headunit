@@ -122,6 +122,19 @@ func newServer(ctx context.Context, cfg config.Config, logger *slog.Logger) (*se
 		shutdownTimeout: defaultShutdownTimeout,
 	}
 
+	authKey, err := auth.LoadOrCreateKey(cfg.DataDir, cfg.AuthSecretKey)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("init auth key: %w", err), srv.closeResources())
+	}
+	passwordCipher, err := auth.NewPasswordCipher(authKey)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("init password cipher: %w", err), srv.closeResources())
+	}
+	authenticator, err := auth.NewSubsonicAuthenticator(st, passwordCipher)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("init authenticator: %w", err), srv.closeResources())
+	}
+
 	streamer, err := stream.NewDirectStreamer(cfg.MusicDir)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("init streamer: %w", err), srv.closeResources())
@@ -135,9 +148,10 @@ func newServer(ctx context.Context, cfg config.Config, logger *slog.Logger) (*se
 	srv.scanner = scanSvc
 
 	handler, err := subsonic.NewHandler(subsonic.Dependencies{
-		Auth:     auth.NoopAuthenticator{},
+		Auth:     authenticator,
 		Scanner:  scanSvc,
 		Store:    st,
+		Users:    st,
 		Streamer: streamer,
 		Logger:   logger,
 	})

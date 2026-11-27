@@ -128,7 +128,7 @@ main() {
   # Host runner UID (e.g., 1001) may differ from non-root container PUID (1000), so allow traversal.
   chmod 0755 "$TMP_DIR" "$MUSIC_DIR"
 
-  export MUSIC_DIR HOST_PORT PUID PGID SCAN_INTERVAL=0 MUSIC_MOUNT_OPTS
+  export MUSIC_DIR HOST_PORT PUID PGID SCAN_INTERVAL=0 MUSIC_MOUNT_OPTS AUTH_SECRET_KEY=""
 
   COMPOSE_STARTED=1
   docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" up -d --build
@@ -173,6 +173,11 @@ main() {
     HEADUNIT_E2E_URL="$base_url" \
     HEADUNIT_E2E_MUSIC_DIR="$MUSIC_DIR" \
     HEADUNIT_E2E_SCAN_TIMEOUT="$SCAN_TIMEOUT" \
+    HEADUNIT_E2E_COMPOSE_FILE="$COMPOSE_FILE" \
+    HEADUNIT_E2E_COMPOSE_PROJECT="$PROJECT_NAME" \
+    HEADUNIT_E2E_SERVICE="headunit" \
+    HEADUNIT_E2E_PUID="$PUID" \
+    HEADUNIT_E2E_PGID="$PGID" \
       go test -tags=e2e -v -count=1 ./e2e
   )
 }

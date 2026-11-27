@@ -30,15 +30,15 @@ This living document tracks **Headunit**'s compatibility against the **Subsonic 
 
 | Surface | Implemented / Total | MVP Target Progress | Notes |
 | :--- | :---: | :---: | :--- |
-| Core Protocol & Wire Features | `9 / 14` | `9 / 9` | XML/JSON, dual routes, POST form parsing, CORS, Range streaming, no-op auth seam |
-| Official Error Codes | `3 / 12` | `3 / 3` | MVP emits codes `0`, `10`, `70` (`40` wired at `auth.Middleware` seam) |
-| OpenSubsonic Extensions | `0 / 10` | `0 / 0` | `getOpenSubsonicExtensions` returns `[]` in MVP |
-| API Endpoints (Total) | `13 / 87` | `18 / 18` (`13 / 13` full + `5 / 5` stubs) | 16 official categories (`13` MVP + `5` MVP Stub + `68` Post-MVP + `1` Deprecated) |
+| Core Protocol & Wire Features | `11 / 14` | `9 / 9` | XML/JSON, dual routes, POST form parsing, CORS, Range streaming, fail-closed auth middleware, salted MD5 & API key auth |
+| Official Error Codes | `8 / 12` | `3 / 3` | Emits codes `0`, `10`, `40`, `42`, `43`, `44`, `50`, `70` |
+| OpenSubsonic Extensions | `1 / 10` | `0 / 0` | Advertises `apiKeyAuthentication` v1 via `getOpenSubsonicExtensions` |
+| API Endpoints (Total) | `14 / 87` | `18 / 18` (`13 / 13` full + `5 / 5` stubs) | 16 official categories (`13` MVP + `5` MVP Stub + `68` Post-MVP [`1` Implemented] + `1` Deprecated) |
 | OpenSubsonic Entity Extensions | `0 / 5` entity groups | `0 / 0` | `Child`, `AlbumID3`, `ArtistID3`, `Playlist`, `Error` |
 
 ---
 
-## 2. Core Protocol & Wire Features (`9 / 14`)
+## 2. Core Protocol & Wire Features (`11 / 14`)
 
 | Feature | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
@@ -52,14 +52,14 @@ This living document tracks **Headunit**'s compatibility against the **Subsonic 
 | CORS headers & `OPTIONS` preflight for web clients | Web/Client Compat | `Implemented` | `MVP` | Enables browser-based clients (e.g., Feishin web); handles `OPTIONS` with `204 No Content` before auth. |
 | HTTP byte-range direct streaming (`Accept-Ranges`, `Range` → `206`, `416`, `ETag`, `If-Range`, `HEAD`) | HTTP / RFC 9110 | `Implemented` | `MVP` | Backed by `DirectStreamer` using `os.OpenRoot` + `http.ServeContent` with strong `ETag`. |
 | On-the-fly transcoding (`ffmpeg` `maxBitRate`/`format` negotiation) | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | `ffmpeg` is pre-bundled in the Docker image and playback routes through the `stream.Streamer` seam; MVP ignores `maxBitRate`/`format`. |
-| Authentication: No-op pass-through seam (`auth.Middleware`) | Headunit MVP | `Implemented` | `MVP` | `NoopAuthenticator` accepts any or no credentials and attaches a synthetic principal until real auth is enabled. |
-| Authentication: Salted MD5 token (`u` + `t` + `s`, min 6-char salt) | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Swap in an `auth.Authenticator` implementation in `cmd/headunit/main.go`. |
-| Authentication: Plaintext / hex password (`u` + `p` / `enc:`) | Subsonic 1.16.1 (Deprecated) | `Not Implemented` | `Post-MVP` | Deferred; discouraged in favor of token or API key auth. |
-| Authentication: API Key (`apiKey=<key>`) | OpenSubsonic (`apiKeyAuthentication`) | `Not Implemented` | `Post-MVP` | Swap in via `auth.Authenticator` seam alongside `tokenInfo`. |
+| Authentication: Middleware seam (`auth.Middleware`) | Headunit MVP | `Implemented` | `MVP` | Fail-closed `SubsonicAuthenticator` is wired in `cmd/headunit/main.go` via `auth.Middleware` (retaining `NoopAuthenticator` for isolated unit tests). |
+| Authentication: Salted MD5 token (`u` + `t` + `s`, min 6-char salt) | Subsonic 1.16.1 | `Implemented` | `Post-MVP` | Verified in `SubsonicAuthenticator` using AES-256-GCM-encrypted stored passwords, `MD5(password + salt)`, and constant-time comparison (min 6-rune salt). |
+| Authentication: Plaintext / hex password (`u` + `p` / `enc:`) | Subsonic 1.16.1 (Deprecated) | `Not Implemented` | `Post-MVP` | Explicitly rejected with OpenSubsonic error `42` (`Provided authentication mechanism not supported`) in favor of salted MD5 token or API key auth. |
+| Authentication: API Key (`apiKey=<key>`) | OpenSubsonic (`apiKeyAuthentication`) | `Implemented` | `Post-MVP` | Verified in `SubsonicAuthenticator` via SHA-256 key hash lookup, revocation/disabled-user checks, and `tokenInfo`. |
 
 ---
 
-## 3. Official Subsonic / OpenSubsonic Error Codes (`3 / 12`)
+## 3. Official Subsonic / OpenSubsonic Error Codes (`8 / 12`)
 
 All Subsonic/OpenSubsonic application errors are returned inside an HTTP `200 OK` envelope with `status="failed"` and an `<error code="..." message="..."/>` (XML) or `"error": {"code": ..., "message": "..."}` (JSON) element.
 
@@ -69,25 +69,25 @@ All Subsonic/OpenSubsonic application errors are returned inside an HTTP `200 OK
 | `10` | Subsonic 1.16.1 | Required parameter is missing. | `Implemented` | `MVP` | Returned for missing required parameters (e.g., `id`, `type`) or unknown `getAlbumList2` `type`. |
 | `20` | Subsonic 1.16.1 | Incompatible Subsonic REST protocol version. Client must upgrade. | `Not Implemented` | `Post-MVP` | MVP does not enforce strict client `v` version gating. |
 | `30` | Subsonic 1.16.1 | Incompatible Subsonic REST protocol version. Server must upgrade. | `Not Implemented` | `Post-MVP` | MVP does not enforce strict client `v` version gating. |
-| `40` | Subsonic 1.16.1 | Wrong username or password. | `Not Implemented` | `Post-MVP` | Wired in the `auth.Middleware` seam; not emitted while `NoopAuthenticator` is active. |
+| `40` | Subsonic 1.16.1 | Wrong username or password. | `Implemented` | `Post-MVP` | Returned by `SubsonicAuthenticator` for missing/malformed credentials, unknown or disabled users, or invalid salted MD5 tokens (including zero-user fail-closed boot). |
 | `41` | Subsonic 1.16.1 | Token authentication not supported for LDAP users. | `Not Implemented` | `Post-MVP` | Out of scope; no LDAP integration. |
-| `42` | OpenSubsonic | Provided authentication mechanism not supported. | `Not Implemented` | `Post-MVP` | Deferred until real authentication mechanisms are enforced. |
-| `43` | OpenSubsonic | Multiple conflicting authentication mechanisms provided. | `Not Implemented` | `Post-MVP` | Deferred until real authentication mechanisms are enforced. |
-| `44` | OpenSubsonic (`apiKeyAuthentication`) | Invalid API key. | `Not Implemented` | `Post-MVP` | Deferred until `apiKeyAuthentication` is implemented. |
-| `50` | Subsonic 1.16.1 | User is not authorized for the given operation. | `Not Implemented` | `Post-MVP` | Deferred until multi-user/role authorization is implemented. |
+| `42` | OpenSubsonic | Provided authentication mechanism not supported. | `Implemented` | `Post-MVP` | Returned for deprecated plaintext/hex `p`/`enc:` authentication and when `tokenInfo` is called without `apiKey` authentication. |
+| `43` | OpenSubsonic | Multiple conflicting authentication mechanisms provided. | `Implemented` | `Post-MVP` | Returned when conflicting authentication mechanisms or duplicate auth parameters (`apiKey`, `u`, `p`, `t`, `s`) are supplied. |
+| `44` | OpenSubsonic (`apiKeyAuthentication`) | Invalid API key. | `Implemented` | `Post-MVP` | Returned when `apiKey` is empty, unknown, revoked, or belongs to a disabled user. |
+| `50` | Subsonic 1.16.1 | User is not authorized for the given operation. | `Implemented` | `Post-MVP` | Returned by `getUser` when a non-admin requests another user (checked before SQLite lookup to prevent username enumeration) or when the target username is blank. |
 | `60` | Subsonic 1.16.1 | The trial period for the Subsonic server is over. | `Not Implemented` | `Post-MVP` | Headunit is open/self-hosted with no licensing trial. |
-| `70` | Subsonic 1.16.1 | The requested data was not found. | `Implemented` | `MVP` | Returned for unknown artist/album/song IDs, missing audio files on disk (`stream`), and `getCoverArt` stub. |
+| `70` | Subsonic 1.16.1 | The requested data was not found. | `Implemented` | `MVP` | Returned for unknown artist/album/song IDs, missing audio files on disk (`stream`), admin `getUser` lookups for unknown users, and `getCoverArt` stub. |
 
 ---
 
-## 4. Official OpenSubsonic Extensions (`0 / 10`)
+## 4. Official OpenSubsonic Extensions (`1 / 10`)
 
-Advertised via `/rest/getOpenSubsonicExtensions`. Headunit returns an empty list (`[]`) in MVP and will only advertise an extension once it conforms completely to that extension's specification.
+Advertised via `/rest/getOpenSubsonicExtensions`. Headunit only advertises an extension once it conforms completely to that extension's specification.
 
 | Extension Name | Spec Versions | Endpoints Added / Modified | Status | Target | Description |
 | :--- | :---: | :--- | :--- | :--- | :--- |
-| `apiKeyAuthentication` | `[1]` | Adds `tokenInfo`; global auth | `Not Implemented` | `Post-MVP` | Authenticates requests using an `apiKey` query/form parameter instead of username/token credentials. |
-| `formPost` | `[1]` | All REST endpoints | `Not Implemented` | `Post-MVP` | Standardizes `POST` `application/x-www-form-urlencoded` requests; MVP parses POST forms, but `getOpenSubsonicExtensions` returns `[]` until full extension verification. |
+| `apiKeyAuthentication` | `[1]` | Adds `tokenInfo`; global auth | `Implemented` | `Post-MVP` | Authenticates requests using an `apiKey` query/form parameter instead of username/token credentials and exposes `tokenInfo` (advertised as version `[1]`). |
+| `formPost` | `[1]` | All REST endpoints | `Not Implemented` | `Post-MVP` | Standardizes `POST` `application/x-www-form-urlencoded` requests; MVP parses POST forms, but `formPost` is not yet advertised by `getOpenSubsonicExtensions` until full extension verification. |
 | `getPodcastEpisode` | `[1]` | Adds `getPodcastEpisode` | `Not Implemented` | `Post-MVP` | Retrieves metadata for a single podcast episode by ID. |
 | `indexBasedQueue` | `[1]` | Adds `getPlayQueueByIndex`, `savePlayQueueByIndex` | `Not Implemented` | `Post-MVP` | Saves and restores server-side play queues using zero-based track indices (supporting duplicate tracks in a queue). |
 | `playbackReport` | `[1]` | Adds `reportPlayback`; extends `getNowPlaying` | `Not Implemented` | `Post-MVP` | Reports structured client playback state/progress and exposes richer now-playing metadata. |
@@ -99,18 +99,18 @@ Advertised via `/rest/getOpenSubsonicExtensions`. Headunit returns an empty list
 
 ---
 
-## 5. Complete Endpoints Compatibility Matrix (`13 / 87`)
+## 5. Complete Endpoints Compatibility Matrix (`14 / 87`)
 
 All implemented endpoints are served under both `/rest/<method>` and `/rest/<method>.view` (except `hls.m3u8`, whose canonical path is `/rest/hls.m3u8`).
 
-### 5.1 System (`3 / 4`)
+### 5.1 System (`4 / 4`)
 
 | Endpoint | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `ping` | Subsonic 1.16.1 | `Implemented` | `MVP` | Bare `status="ok"` envelope (Docker `HEALTHCHECK` probes unauthenticated `/healthz`). |
+| `ping` | Subsonic 1.16.1 | `Implemented` | `MVP` | Bare `status="ok"` envelope behind `auth.Middleware` (Docker `HEALTHCHECK` probes unauthenticated `/healthz`). |
 | `getLicense` | Subsonic 1.16.1 | `Implemented` | `MVP` | Returns `license: {valid: true}`. |
-| `getOpenSubsonicExtensions` | OpenSubsonic | `Implemented` | `MVP` | Returns empty `openSubsonicExtensions: []` (zero extension claims until `apiKeyAuthentication` is wired). Bypasses `auth.Middleware` directly per OpenSubsonic spec while preserving CORS and form parsing. |
-| `tokenInfo` | OpenSubsonic (`apiKeyAuthentication`) | `Partial` | `Post-MVP` | Handler and routes implemented; returns `tokenInfo.username` for `AuthMethodAPIKey` principals and error `42` otherwise. Marked `Partial` until `SubsonicAuthenticator` is wired in `cmd/headunit/main.go`. |
+| `getOpenSubsonicExtensions` | OpenSubsonic | `Implemented` | `MVP` | Advertises `apiKeyAuthentication` v1 (`versions: [1]`). Bypasses `auth.Middleware` directly per OpenSubsonic spec while preserving CORS and form parsing. |
+| `tokenInfo` | OpenSubsonic (`apiKeyAuthentication`) | `Implemented` | `Post-MVP` | Returns `tokenInfo.username` for `AuthMethodAPIKey` principals and Subsonic error `42` otherwise. |
 
 ### 5.2 Browsing (`5 / 20`)
 
@@ -237,12 +237,12 @@ All implemented endpoints are served under both `/rest/<method>` and `/rest/<met
 
 | Endpoint | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `getUser` | Subsonic 1.16.1 | `Implemented` | `MVP` | Returns synthetic user (echoes `username` or context principal) with `streamRole: true`, `downloadRole: false`, all other `*Role: false`, `scrobblingEnabled: false`, `folder: [1]`. |
-| `getUsers` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred until multi-user account management is implemented. |
-| `createUser` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred until multi-user account management is implemented. |
-| `updateUser` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred until multi-user account management is implemented. |
-| `deleteUser` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred until multi-user account management is implemented. |
-| `changePassword` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred until user authentication is implemented. |
+| `getUser` | Subsonic 1.16.1 | `Implemented` | `MVP` | Store-backed user lookup (defaults to authenticated principal when `username` is omitted); enforces self-or-admin authorization before querying SQLite (`50` on non-admin cross-user or blank target; `70` on admin unknown user); returns canonical `username`, real `adminRole`, `streamRole: true`, `downloadRole: false`, all other `*Role: false`, `scrobblingEnabled: false`, `folder: [1]` (omits `coverArt`). |
+| `getUsers` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; user accounts are listed via the local CLI (`headunit user list`) with no HTTP user-management endpoints. |
+| `createUser` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; user accounts are provisioned via the local CLI (`headunit user create`) with no HTTP user-mutation endpoints. |
+| `updateUser` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; user accounts are managed via the local CLI (`headunit user set-admin` / `disable` / `enable`) with no HTTP user-mutation endpoints. |
+| `deleteUser` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; user accounts are deleted via the local CLI (`headunit user delete`) with no HTTP user-mutation endpoints. |
+| `changePassword` | Subsonic 1.16.1 | `Not Implemented` | `Post-MVP` | Deferred; passwords are updated via the local CLI (`headunit user passwd`) with no HTTP user-mutation endpoints. |
 
 ### 5.14 Bookmarks (`0 / 7`)
 

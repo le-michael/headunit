@@ -30,10 +30,17 @@ type LibraryStore interface {
 	Search3(ctx context.Context, q store.Search3Query) (store.Search3Result, error)
 }
 
+// UserStore provides read-only user lookups for OpenSubsonic getUser queries.
+// Implementations must be safe for concurrent use across HTTP handler goroutines.
+type UserStore interface {
+	GetUserByUsername(ctx context.Context, username string) (*store.User, error)
+}
+
 // Compile-time interface assertions.
 var (
 	_ ScanStatusProvider = (*scanner.Service)(nil)
 	_ LibraryStore       = (*store.Store)(nil)
+	_ UserStore          = (*store.Store)(nil)
 	_ auth.ErrorWriter   = WriteError
 )
 
@@ -48,6 +55,9 @@ type Dependencies struct {
 	// Store supplies read-only library metadata and track lookups. Required.
 	Store LibraryStore
 
+	// Users supplies read-only user lookups for getUser. Required.
+	Users UserStore
+
 	// Streamer serves audio playback for /rest/stream. Required.
 	Streamer stream.Streamer
 
@@ -59,12 +69,14 @@ type Dependencies struct {
 type handler struct {
 	scanner  ScanStatusProvider
 	store    LibraryStore
+	users    UserStore
 	streamer stream.Streamer
 	logger   *slog.Logger
 }
 
 // NewHandler constructs the Headunit OpenSubsonic v1.16.1 HTTP handler.
-// Returns an error if deps.Auth, deps.Scanner, deps.Store, or deps.Streamer is nil.
+// Returns an error if deps.Auth, deps.Scanner, deps.Store, deps.Users, or
+// deps.Streamer is nil.
 func NewHandler(deps Dependencies) (http.Handler, error) {
 	if deps.Auth == nil {
 		return nil, errors.New("subsonic: auth authenticator must not be nil")
@@ -74,6 +86,9 @@ func NewHandler(deps Dependencies) (http.Handler, error) {
 	}
 	if deps.Store == nil {
 		return nil, errors.New("subsonic: library store must not be nil")
+	}
+	if deps.Users == nil {
+		return nil, errors.New("subsonic: user store must not be nil")
 	}
 	if deps.Streamer == nil {
 		return nil, errors.New("subsonic: streamer must not be nil")
@@ -86,6 +101,7 @@ func NewHandler(deps Dependencies) (http.Handler, error) {
 	h := &handler{
 		scanner:  deps.Scanner,
 		store:    deps.Store,
+		users:    deps.Users,
 		streamer: deps.Streamer,
 		logger:   logger,
 	}

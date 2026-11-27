@@ -41,7 +41,7 @@ func TestWatcher(t *testing.T) {
 			return !s.Scanning && s.Count == 2
 		})
 
-		searchEnv, _ := h.getJSON(t, "/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500")
+		searchEnv, _ := h.getJSON(t, h.withDefaultAuth(t, "/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500"))
 		assertJSONResponseEnvelope(t, searchEnv, "ok")
 		if searchEnv.SearchResult3 == nil {
 			t.Fatalf("search3 SearchResult3 = nil, want non-nil")
@@ -59,7 +59,7 @@ func TestWatcher(t *testing.T) {
 		}
 		wavTrackID = wavSong.ID
 
-		resp, body := h.doRequest(t, http.MethodGet, "/rest/stream?id="+url.QueryEscape(flacTrackID), nil, nil)
+		resp, body := h.doRequest(t, http.MethodGet, h.withDefaultAuth(t, "/rest/stream?id="+url.QueryEscape(flacTrackID)), nil, nil)
 		if got, want := resp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("GET /rest/stream live FLAC status = %d, want %d (body=%s)", got, want, string(body))
 		}

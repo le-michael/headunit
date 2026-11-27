@@ -3,16 +3,23 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,12 +27,22 @@ import (
 	"headunit/internal/testutil"
 )
 
-const pollInterval = 50 * time.Millisecond
+const (
+	pollInterval = 50 * time.Millisecond
+	execTimeout  = 30 * time.Second
+)
+
+var testUserSeq atomic.Uint64
 
 type config struct {
-	baseURL     string
-	musicDir    string
-	scanTimeout time.Duration
+	baseURL        string
+	musicDir       string
+	scanTimeout    time.Duration
+	composeFile    string
+	composeProject string
+	service        string
+	puid           string
+	pgid           string
 }
 
 type jsonSubsonicEnvelope struct {
@@ -36,21 +53,65 @@ type harness struct {
 	cfg          config
 	client       *http.Client
 	cleanupPaths []string
+	username     string
+	password     string
+	apiKeyID     string
+	apiKey       string
+	saltSeq      atomic.Uint64
+}
+
+func newRawHarness(t *testing.T) *harness {
+	t.Helper()
+
+	return &harness{
+		cfg:    loadConfig(t),
+		client: newProxyBypassHTTPClient(t),
+	}
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
-	h := &harness{
-		cfg:    loadConfig(t),
-		client: newProxyBypassHTTPClient(t),
-	}
-	// Register fixture cleanup after newProxyBypassHTTPClient so Go's LIFO
-	// t.Cleanup order runs cleanupFixtures before closing idle connections.
+	h := newRawHarness(t)
+	username := uniqueTestUsername(t)
+	password := "e2e-pass-" + username
+
+	h.createUser(t, username, password, false)
+	// Register user deletion before cleanupFixtures so Go's LIFO t.Cleanup
+	// drains library fixtures while auth credentials remain valid, and both run
+	// before newProxyBypassHTTPClient closes idle connections.
+	t.Cleanup(func() {
+		h.deleteUser(t, username)
+	})
+
+	keyID, apiKey := h.createAPIKey(t, username, "e2e-harness")
+	h.username = username
+	h.password = password
+	h.apiKeyID = keyID
+	h.apiKey = apiKey
+
 	t.Cleanup(func() {
 		h.cleanupFixtures(t)
 	})
 	return h
+}
+
+func uniqueTestUsername(t *testing.T) string {
+	t.Helper()
+
+	var b strings.Builder
+	for i := range len(t.Name()) {
+		c := t.Name()[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			b.WriteByte(c)
+		case c >= 'A' && c <= 'Z':
+			b.WriteByte(c + ('a' - 'A'))
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return fmt.Sprintf("e2e_%s_%d_%d", b.String(), os.Getpid(), testUserSeq.Add(1))
 }
 
 func loadConfig(t *testing.T) config {
@@ -92,11 +153,247 @@ func loadConfig(t *testing.T) config {
 		scanTimeout = parsed
 	}
 
-	return config{
-		baseURL:     baseURL,
-		musicDir:    musicDir,
-		scanTimeout: scanTimeout,
+	composeFile := strings.TrimSpace(os.Getenv("HEADUNIT_E2E_COMPOSE_FILE"))
+	if composeFile == "" {
+		t.Fatalf("HEADUNIT_E2E_COMPOSE_FILE must be set when running -tags=e2e")
 	}
+	if _, err := os.Stat(composeFile); err != nil {
+		t.Fatalf("HEADUNIT_E2E_COMPOSE_FILE %q stat error: %v", composeFile, err)
+	}
+
+	composeProject := strings.TrimSpace(os.Getenv("HEADUNIT_E2E_COMPOSE_PROJECT"))
+	if composeProject == "" {
+		t.Fatalf("HEADUNIT_E2E_COMPOSE_PROJECT must be set when running -tags=e2e")
+	}
+
+	service := strings.TrimSpace(os.Getenv("HEADUNIT_E2E_SERVICE"))
+	if service == "" {
+		t.Fatalf("HEADUNIT_E2E_SERVICE must be set when running -tags=e2e")
+	}
+
+	puid := strings.TrimSpace(os.Getenv("HEADUNIT_E2E_PUID"))
+	if !isNonNegativeIntString(puid) {
+		t.Fatalf("HEADUNIT_E2E_PUID=%q must be a non-negative integer when running -tags=e2e", puid)
+	}
+
+	pgid := strings.TrimSpace(os.Getenv("HEADUNIT_E2E_PGID"))
+	if !isNonNegativeIntString(pgid) {
+		t.Fatalf("HEADUNIT_E2E_PGID=%q must be a non-negative integer when running -tags=e2e", pgid)
+	}
+
+	return config{
+		baseURL:        baseURL,
+		musicDir:       musicDir,
+		scanTimeout:    scanTimeout,
+		composeFile:    composeFile,
+		composeProject: composeProject,
+		service:        service,
+		puid:           puid,
+		pgid:           pgid,
+	}
+}
+
+func isNonNegativeIntString(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *harness) execCompose(t *testing.T, stdin io.Reader, extraEnv []string, execArgs ...string) string {
+	t.Helper()
+
+	out, err := h.execComposeRaw(stdin, extraEnv, execArgs...)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return out
+}
+
+func (h *harness) execComposeRaw(stdin io.Reader, extraEnv []string, execArgs ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), execTimeout)
+	defer cancel()
+
+	fullArgs := make([]string, 0, 6+len(execArgs))
+	fullArgs = append(fullArgs, "compose", "-f", h.cfg.composeFile, "-p", h.cfg.composeProject, "exec", "-T")
+	fullArgs = append(fullArgs, execArgs...)
+
+	cmd := exec.CommandContext(ctx, "docker", fullArgs...)
+	cmd.Stdin = stdin
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return stdout.String(), fmt.Errorf("docker %s: %w (stderr: %s)", strings.Join(fullArgs, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+func (h *harness) execHeadunit(t *testing.T, stdin io.Reader, extraEnv []string, args ...string) string {
+	t.Helper()
+
+	out, err := h.execHeadunitRaw(stdin, extraEnv, args...)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return out
+}
+
+func (h *harness) execHeadunitRaw(stdin io.Reader, extraEnv []string, args ...string) (string, error) {
+	execArgs := make([]string, 0, len(extraEnv)*2+2+len(args))
+	for _, entry := range extraEnv {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || name == "" {
+			return "", fmt.Errorf("invalid extraEnv entry %q: want KEY=VALUE", entry)
+		}
+		// Forward only the variable name on argv (-e VAR); secret values stay in cmd.Env.
+		execArgs = append(execArgs, "-e", name)
+	}
+	execArgs = append(execArgs, h.cfg.service, "/usr/local/bin/entrypoint.sh")
+	execArgs = append(execArgs, args...)
+	return h.execComposeRaw(stdin, extraEnv, execArgs...)
+}
+
+func (h *harness) createUser(t *testing.T, username, password string, isAdmin bool) {
+	t.Helper()
+
+	args := []string{"user", "create", "--username", username, "--password-stdin"}
+	if isAdmin {
+		args = append(args, "--admin")
+	}
+	h.execHeadunit(t, strings.NewReader(password+"\n"), nil, args...)
+}
+
+func (h *harness) createUserWithEnv(t *testing.T, username, envVar, password string, isAdmin bool) {
+	t.Helper()
+
+	args := []string{"user", "create", "--username", username, "--password-env", envVar}
+	if isAdmin {
+		args = append(args, "--admin")
+	}
+	h.execHeadunit(t, nil, []string{envVar + "=" + password}, args...)
+}
+
+func (h *harness) createAPIKey(t *testing.T, username, keyName string) (keyID, apiKey string) {
+	t.Helper()
+
+	args := []string{"apikey", "create", "--username", username}
+	if keyName != "" {
+		args = append(args, "--name", keyName)
+	}
+	out := h.execHeadunit(t, nil, nil, args...)
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "id":
+			keyID = strings.TrimSpace(v)
+		case "api_key":
+			apiKey = strings.TrimSpace(v)
+		}
+	}
+	if keyID == "" || apiKey == "" {
+		t.Fatalf("apikey create output missing id or api_key: %q", out)
+	}
+	return keyID, apiKey
+}
+
+func (h *harness) revokeAPIKey(t *testing.T, keyID string) {
+	t.Helper()
+
+	h.execHeadunit(t, nil, nil, "apikey", "revoke", "--id", keyID)
+}
+
+func (h *harness) disableUser(t *testing.T, username string) {
+	t.Helper()
+
+	h.execHeadunit(t, nil, nil, "user", "disable", "--username", username)
+}
+
+func (h *harness) deleteUser(t *testing.T, username string) {
+	t.Helper()
+
+	if _, err := h.execHeadunitRaw(nil, nil, "user", "delete", "--username", username); err != nil {
+		t.Errorf("delete user %q: %v", username, err)
+	}
+}
+
+func tokenParams(username, password, salt string) url.Values {
+	sum := md5.Sum([]byte(password + salt))
+	v := url.Values{}
+	v.Set("u", username)
+	v.Set("t", hex.EncodeToString(sum[:]))
+	v.Set("s", salt)
+	return v
+}
+
+func apiKeyParams(apiKey string) url.Values {
+	v := url.Values{}
+	v.Set("apiKey", apiKey)
+	return v
+}
+
+func (h *harness) nextSalt() string {
+	return fmt.Sprintf("e2esalt%04d", h.saltSeq.Add(1))
+}
+
+func (h *harness) withParams(t *testing.T, rawPath string, params url.Values) string {
+	t.Helper()
+
+	if len(params) == 0 {
+		return rawPath
+	}
+	u, err := url.Parse(rawPath)
+	if err != nil {
+		t.Fatalf("url.Parse(%q) unexpected error: %v", rawPath, err)
+	}
+	q := u.Query()
+	for k, vals := range params {
+		q[k] = slices.Clone(vals)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func (h *harness) withTokenAuth(t *testing.T, rawPath string) string {
+	t.Helper()
+
+	if h.username == "" || h.password == "" {
+		t.Fatalf("withTokenAuth called on harness without provisioned user")
+	}
+	return h.withParams(t, rawPath, tokenParams(h.username, h.password, h.nextSalt()))
+}
+
+func (h *harness) withAPIKeyAuth(t *testing.T, rawPath string) string {
+	t.Helper()
+
+	if h.apiKey == "" {
+		t.Fatalf("withAPIKeyAuth called on harness without provisioned API key")
+	}
+	return h.withParams(t, rawPath, apiKeyParams(h.apiKey))
+}
+
+func (h *harness) withDefaultAuth(t *testing.T, rawPath string) string {
+	t.Helper()
+
+	if h.apiKey != "" {
+		return h.withAPIKeyAuth(t, rawPath)
+	}
+	if h.username != "" && h.password != "" {
+		return h.withTokenAuth(t, rawPath)
+	}
+	return rawPath
 }
 
 func newProxyBypassHTTPClient(t *testing.T) *http.Client {
@@ -293,6 +590,25 @@ func (h *harness) getJSON(t *testing.T, path string) (subsonic.Response, []byte)
 	return decodeJSONResponse(t, body), body
 }
 
+func (h *harness) getXML(t *testing.T, path string) (subsonic.Response, []byte) {
+	t.Helper()
+
+	resp, body := h.doRequest(t, http.MethodGet, path, nil, nil)
+	if got, want := resp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("GET %s status = %d, want %d (body=%s)", path, got, want, string(body))
+	}
+	if got, want := resp.Header.Get("Content-Type"), "application/xml; charset=utf-8"; got != want {
+		t.Errorf("GET %s Content-Type = %q, want %q", path, got, want)
+	}
+	if got, want := resp.Header.Get("X-Content-Type-Options"), "nosniff"; got != want {
+		t.Errorf("GET %s X-Content-Type-Options = %q, want %q", path, got, want)
+	}
+	if !bytes.HasPrefix(body, []byte(xml.Header)) {
+		t.Errorf("GET %s body = %q, want xml.Header prefix %q", path, string(body), xml.Header)
+	}
+	return decodeXMLResponse(t, body), body
+}
+
 func (h *harness) pollScanStatus(t *testing.T, ready func(subsonic.ScanStatus) bool) subsonic.ScanStatus {
 	t.Helper()
 
@@ -302,7 +618,7 @@ func (h *harness) pollScanStatus(t *testing.T, ready func(subsonic.ScanStatus) b
 
 	var last subsonic.ScanStatus
 	for {
-		env, _ := h.getJSON(t, "/rest/getScanStatus?f=json")
+		env, _ := h.getJSON(t, h.withDefaultAuth(t, "/rest/getScanStatus?f=json"))
 		assertJSONResponseEnvelope(t, env, "ok")
 		if env.ScanStatus != nil {
 			last = *env.ScanStatus
@@ -320,7 +636,7 @@ func (h *harness) pollScanStatus(t *testing.T, ready func(subsonic.ScanStatus) b
 func (h *harness) assertStreamNotFound(t *testing.T, trackID string) {
 	t.Helper()
 
-	path := "/rest/stream?id=" + url.QueryEscape(trackID) + "&f=json"
+	path := h.withDefaultAuth(t, "/rest/stream?id="+url.QueryEscape(trackID)+"&f=json")
 	errResp, errBody := h.doRequest(t, http.MethodGet, path, nil, nil)
 	if got, want := errResp.StatusCode, http.StatusOK; got != want {
 		t.Fatalf("GET %s status = %d, want %d", path, got, want)
@@ -337,6 +653,56 @@ func (h *harness) assertStreamNotFound(t *testing.T, trackID string) {
 	assertJSONResponseEnvelope(t, errEnv, "failed")
 	if errEnv.Error == nil || errEnv.Error.Code != 70 {
 		t.Errorf("stream error payload = %+v, want code 70", errEnv.Error)
+	}
+}
+
+func (h *harness) assertHealthz(t *testing.T) {
+	t.Helper()
+
+	getResp, getBody := h.doRequest(t, http.MethodGet, "/healthz", nil, nil)
+	if got, want := getResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("GET /healthz status = %d, want %d (body=%s)", got, want, string(getBody))
+	}
+	if got, want := getResp.Header.Get("Content-Type"), "text/plain; charset=utf-8"; got != want {
+		t.Errorf("GET /healthz Content-Type = %q, want %q", got, want)
+	}
+	if got, want := getResp.Header.Get("X-Content-Type-Options"), "nosniff"; got != want {
+		t.Errorf("GET /healthz X-Content-Type-Options = %q, want %q", got, want)
+	}
+	if got, want := string(getBody), "ok\n"; got != want {
+		t.Errorf("GET /healthz body = %q, want %q", got, want)
+	}
+
+	headResp, headBody := h.doRequest(t, http.MethodHead, "/healthz", nil, nil)
+	if got, want := headResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("HEAD /healthz status = %d, want %d", got, want)
+	}
+	if got, want := headResp.Header.Get("Content-Type"), "text/plain; charset=utf-8"; got != want {
+		t.Errorf("HEAD /healthz Content-Type = %q, want %q", got, want)
+	}
+	if got, want := headResp.Header.Get("Content-Length"), "3"; got != want {
+		t.Errorf("HEAD /healthz Content-Length = %q, want %q", got, want)
+	}
+	if got := len(headBody); got != 0 {
+		t.Errorf("HEAD /healthz body len = %d, want 0", got)
+	}
+}
+
+func assertAPIKeyExtension(t *testing.T, env subsonic.Response) {
+	t.Helper()
+
+	if env.OpenSubsonicExtensions == nil {
+		t.Fatalf("openSubsonicExtensions = nil, want non-nil")
+	}
+	exts := *env.OpenSubsonicExtensions
+	if got, want := len(exts), 1; got != want {
+		t.Fatalf("len(openSubsonicExtensions) = %d, want %d (%+v)", got, want, exts)
+	}
+	if got, want := exts[0].Name, "apiKeyAuthentication"; got != want {
+		t.Errorf("openSubsonicExtensions[0].Name = %q, want %q", got, want)
+	}
+	if got, want := exts[0].Versions, []int{1}; !slices.Equal(got, want) {
+		t.Errorf("openSubsonicExtensions[0].Versions = %v, want %v", got, want)
 	}
 }
 

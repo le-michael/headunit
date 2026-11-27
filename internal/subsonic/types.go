@@ -10,9 +10,9 @@ const (
 	xmlNamespace         = "http://subsonic.org/restapi"
 	statusOK             = "ok"
 	statusFailed         = "failed"
-	defaultUsername      = "headunit"
 	errCodeGeneric       = 0
 	errCodeMissingParam  = 10
+	errCodeNotAuthorized = 50
 	errCodeNotFound      = 70
 	maxFormBodyBytes     = 1 << 20 // 1 MiB
 	musicFolderID        = 1
@@ -22,7 +22,9 @@ const (
 	defaultSearch3Count  = 20
 	mediaTypeMusic       = "music"
 	healthzBody          = "ok\n"
+	extAPIKeyAuth        = "apiKeyAuthentication"
 	msgUnsupportedAuth   = "Provided authentication mechanism not supported"
+	msgNotAuthorized     = "User is not authorized for the given operation"
 )
 
 type jsonEnvelope struct {
