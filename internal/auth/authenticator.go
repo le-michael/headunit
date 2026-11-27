@@ -31,6 +31,7 @@ var _ AuthStore = (*store.Store)(nil)
 
 // SubsonicAuthenticator authenticates OpenSubsonic HTTP requests using either
 // salted MD5 tokens (u+t+s) or OpenSubsonic API keys (apiKeyAuthentication).
+// It is safe for concurrent use when backed by a concurrency-safe AuthStore.
 type SubsonicAuthenticator struct {
 	store  AuthStore
 	cipher *PasswordCipher
@@ -51,7 +52,8 @@ func NewSubsonicAuthenticator(st AuthStore, cipher *PasswordCipher) (*SubsonicAu
 }
 
 // Authenticate validates OpenSubsonic credentials on r and returns the
-// resolved Principal or a client-safe *AuthError.
+// resolved Principal or a client-safe *AuthError. It lazily invokes
+// r.ParseForm() when r.Form == nil.
 func (a *SubsonicAuthenticator) Authenticate(r *http.Request) (Principal, error) {
 	if a == nil || a.store == nil || a.cipher == nil || a.cipher.aead == nil || r == nil {
 		return Principal{}, errWrongCredentials()

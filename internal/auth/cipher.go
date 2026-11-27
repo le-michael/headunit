@@ -210,7 +210,11 @@ func (c *PasswordCipher) Decrypt(blob []byte) (string, error) {
 }
 
 // GenerateAPIKey creates a new random Headunit OpenSubsonic API key along with
-// its non-secret display prefix and SHA-256 hex digest.
+// its non-secret display prefix and SHA-256 digest. The returned plaintext is
+// "hu_" followed by 64 lowercase hexadecimal characters (32 random bytes, 67
+// characters total), prefix is the leading 11 characters ("hu_" + 8 hex
+// characters), and hash is the 64-character lowercase hex SHA-256 digest of
+// plaintext.
 func GenerateAPIKey() (plaintext, prefix, hash string, err error) {
 	raw := make([]byte, apiKeyRandomBytes)
 	if _, err := rand.Read(raw); err != nil {
