@@ -23,7 +23,7 @@ type pendingEntry struct {
 }
 
 // watcher coordinates recursive fsnotify monitoring, debounced stability
-// checks, and metadata ingestion for a resolved music root directory.
+// checks, and metadata ingestion for a single resolved library root directory.
 //
 // Concurrency & Lock-Ordering Invariant:
 // Service.scanMu, watcher.watchMu, and watcher.pendingMu are strict leaf locks
@@ -39,12 +39,14 @@ type pendingEntry struct {
 // timer callback's defer balances workerWG while closed and entry.gen fence any
 // stale or canceled firing before semaphore acquisition or worker execution.
 type watcher struct {
-	svc       *Service
-	rootDir   string
-	fsWatcher *fsnotify.Watcher
-	events    chan fsnotify.Event
-	rescan    chan struct{}
-	workerSem chan struct{}
+	svc           *Service
+	source        string
+	configuredDir string
+	rootDir       string
+	fsWatcher     *fsnotify.Watcher
+	events        chan fsnotify.Event
+	rescan        chan struct{}
+	workerSem     chan struct{}
 
 	watchMu     sync.Mutex
 	watchedDirs map[string]os.FileInfo
@@ -60,19 +62,22 @@ type watcher struct {
 
 	cancel      context.CancelFunc
 	limitWarned atomic.Bool
+	rescanCount atomic.Int64
 }
 
-func (s *Service) startWatcher(ctx context.Context, walkRoot string) *watcher {
+func (s *Service) startWatcher(ctx context.Context, source, configuredDir, walkRoot string) *watcher {
 	fw, err := s.newWatcherFn()
 	if err != nil {
 		if isWatcherLimitError(err) {
 			s.logger.Warn("scanner: live watcher disabled due to OS watch limit; increase fs.inotify.max_user_watches or fs.inotify.max_user_instances",
-				"music_dir", walkRoot,
+				"source", source,
+				"dir", walkRoot,
 				"error", err,
 			)
 		} else {
 			s.logger.Warn("scanner: live watcher disabled; failed to create fsnotify watcher",
-				"music_dir", walkRoot,
+				"source", source,
+				"dir", walkRoot,
 				"error", err,
 			)
 		}
@@ -81,15 +86,17 @@ func (s *Service) startWatcher(ctx context.Context, walkRoot string) *watcher {
 
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	w := &watcher{
-		svc:         s,
-		rootDir:     walkRoot,
-		fsWatcher:   fw,
-		events:      make(chan fsnotify.Event, s.maxEventQueue),
-		rescan:      make(chan struct{}, 1),
-		workerSem:   make(chan struct{}, workerLimit),
-		watchedDirs: make(map[string]os.FileInfo),
-		pending:     make(map[string]pendingEntry),
-		cancel:      watchCancel,
+		svc:           s,
+		source:        source,
+		configuredDir: configuredDir,
+		rootDir:       walkRoot,
+		fsWatcher:     fw,
+		events:        make(chan fsnotify.Event, s.maxEventQueue),
+		rescan:        make(chan struct{}, 1),
+		workerSem:     make(chan struct{}, workerLimit),
+		watchedDirs:   make(map[string]os.FileInfo),
+		pending:       make(map[string]pendingEntry),
+		cancel:        watchCancel,
 	}
 
 	// Start eventLoop before registering recursive watches so fsnotify.Events
@@ -177,7 +184,10 @@ func (w *watcher) eventLoop(ctx context.Context) {
 				continue
 			}
 			if errors.Is(err, fsnotify.ErrEventOverflow) {
-				w.svc.logger.Warn("scanner: fsnotify event queue overflow; scheduling full reconciliation", "error", err)
+				w.svc.logger.Warn("scanner: fsnotify event queue overflow; scheduling full reconciliation",
+					"source", w.source,
+					"error", err,
+				)
 				w.triggerRescan()
 				continue
 			}
@@ -231,6 +241,7 @@ func (w *watcher) dispatchLoop(ctx context.Context) {
 func (w *watcher) triggerRescan() {
 	select {
 	case w.rescan <- struct{}{}:
+		w.rescanCount.Add(1)
 		w.svc.rescanCount.Add(1)
 	default:
 	}
@@ -256,8 +267,12 @@ drainLoop:
 	w.pruneMissingWatches()
 	w.addRecursiveWatches(ctx, w.rootDir, false)
 
-	if err := w.svc.ScanNow(ctx); err != nil && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
-		w.svc.logger.Warn("scanner: overflow reconciliation scan failed", "music_dir", w.rootDir, "error", err)
+	if err := w.svc.scanRoot(ctx, scanRoot{source: w.source, dir: w.configuredDir}); err != nil && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+		w.svc.logger.Warn("scanner: overflow reconciliation scan failed",
+			"source", w.source,
+			"dir", w.configuredDir,
+			"error", err,
+		)
 	}
 }
 
@@ -302,7 +317,8 @@ func (w *watcher) handleEvent(ctx context.Context, ev fsnotify.Event) {
 	absPath := filepath.Clean(ev.Name)
 	if absPath == w.rootDir {
 		if ev.Has(fsnotify.Remove | fsnotify.Rename) {
-			w.svc.logger.Warn("scanner: ignoring remove/rename event on music root directory",
+			w.svc.logger.Warn("scanner: ignoring remove/rename event on "+w.source+" root directory",
+				"source", w.source,
 				"path", absPath,
 				"op", ev.Op.String(),
 			)
@@ -376,9 +392,10 @@ func (w *watcher) deleteDirTracks(ctx context.Context, relDir string) {
 	if ctx.Err() != nil {
 		return
 	}
-	if err := w.svc.store.DeleteByDirPrefix(ctx, relDir); err != nil {
+	if err := w.svc.store.DeleteByDirPrefix(ctx, w.source, relDir); err != nil {
 		if ctx.Err() == nil {
 			w.svc.logger.Warn("scanner: failed to delete tracks under removed directory",
+				"source", w.source,
 				"rel_dir", relDir,
 				"error", err,
 			)
@@ -399,9 +416,10 @@ func (w *watcher) deleteFileTrack(ctx context.Context, relPath string) {
 	if ctx.Err() != nil {
 		return
 	}
-	if err := w.svc.store.DeleteByRelPath(ctx, relPath); err != nil {
+	if err := w.svc.store.DeleteByRelPath(ctx, w.source, relPath); err != nil {
 		if ctx.Err() == nil {
 			w.svc.logger.Warn("scanner: failed to delete removed track",
+				"source", w.source,
 				"rel_path", relPath,
 				"error", err,
 			)
@@ -723,11 +741,11 @@ func (w *watcher) ingestFile(ctx context.Context, absPath, relPath string, stabl
 		return
 	}
 
-	tr := buildTrack(relPath, curInfo.Size(), curInfo.ModTime().UnixNano(), meta)
+	tr := buildTrack(w.source, relPath, curInfo.Size(), curInfo.ModTime().UnixNano(), meta)
 	if err := w.svc.store.UpsertTrack(ctx, &tr); err != nil {
 		w.svc.scanMu.Unlock()
 		if ctx.Err() == nil {
-			w.svc.logger.Warn("scanner: failed to upsert track", "rel_path", relPath, "error", err)
+			w.svc.logger.Warn("scanner: failed to upsert track", "source", w.source, "rel_path", relPath, "error", err)
 		}
 		return
 	}
@@ -738,7 +756,8 @@ func (w *watcher) ingestFile(ctx context.Context, absPath, relPath string, stabl
 func (w *watcher) warnWatcherLimit(err error) {
 	if w.limitWarned.CompareAndSwap(false, true) {
 		w.svc.logger.Warn("scanner: OS watch limit reached; increase fs.inotify.max_user_watches or fs.inotify.max_user_instances",
-			"music_dir", w.rootDir,
+			"source", w.source,
+			"dir", w.rootDir,
 			"error", err,
 		)
 	}

@@ -38,8 +38,22 @@ func openTestStore(t *testing.T) *store.Store {
 
 func seedTracks(t *testing.T, st *store.Store, tracks ...store.Track) {
 	t.Helper()
-	if err := st.ApplyScanBatch(context.Background(), tracks, nil); err != nil {
-		t.Fatalf("ApplyScanBatch() error = %v", err)
+	bySource := make(map[string][]store.Track)
+	var sources []string
+	for _, tr := range tracks {
+		src := tr.Source
+		if src == "" {
+			src = store.SourceMusic
+		}
+		if _, seen := bySource[src]; !seen {
+			sources = append(sources, src)
+		}
+		bySource[src] = append(bySource[src], tr)
+	}
+	for _, src := range sources {
+		if err := st.ApplyScanBatch(context.Background(), src, bySource[src], nil); err != nil {
+			t.Fatalf("ApplyScanBatch(%q) error = %v", src, err)
+		}
 	}
 }
 
@@ -1261,4 +1275,209 @@ func TestLibraryStoreErrorsSanitized(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestChildPath_MusicVsUploads(t *testing.T) {
+	const sharedRelPath = "Artist/Shared Album/01_track.flac"
+	const defaultRelPath = "Artist/Shared Album/03_default.mp3"
+
+	assertChildPaths := func(t *testing.T, songs []subsonic.Child, wantByID map[string]string) {
+		t.Helper()
+		if len(songs) != len(wantByID) {
+			t.Fatalf("len(songs) = %d, want %d (%+v)", len(songs), len(wantByID), songs)
+		}
+		got := make(map[string]string, len(songs))
+		for _, s := range songs {
+			got[s.ID] = s.Path
+		}
+		if !reflect.DeepEqual(got, wantByID) {
+			t.Errorf("song paths = %v, want %v", got, wantByID)
+		}
+	}
+
+	assertJSONChildPaths := func(t *testing.T, items []any, wantByID map[string]string) {
+		t.Helper()
+		if len(items) != len(wantByID) {
+			t.Fatalf("len(items) = %d, want %d (%v)", len(items), len(wantByID), items)
+		}
+		got := make(map[string]string, len(items))
+		for i := range items {
+			item := mustJSONItemMap(t, items, i)
+			got[mustJSONString(t, item, "id")] = mustJSONString(t, item, "path")
+		}
+		if !reflect.DeepEqual(got, wantByID) {
+			t.Errorf("JSON song paths = %v, want %v", got, wantByID)
+		}
+	}
+
+	t.Run("SQLite multi-source with identical relPath", func(t *testing.T) {
+		st := openTestStore(t)
+		now := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+		seedTracks(t, st,
+			store.Track{
+				ID:          "tr_music_shared",
+				Source:      store.SourceMusic,
+				RelPath:     sharedRelPath,
+				FileSize:    1000,
+				MtimeNs:     1,
+				Title:       "Shared Song Music",
+				Artist:      "Shared Artist",
+				AlbumArtist: "Shared Artist",
+				Album:       "Shared Album",
+				TrackNum:    1,
+				DiscNum:     1,
+				CreatedAt:   now,
+			},
+			store.Track{
+				ID:          "tr_upload_shared",
+				Source:      store.SourceUploads,
+				RelPath:     sharedRelPath,
+				FileSize:    2000,
+				MtimeNs:     2,
+				Title:       "Shared Song Upload",
+				Artist:      "Shared Artist",
+				AlbumArtist: "Shared Artist",
+				Album:       "Shared Album",
+				TrackNum:    2,
+				DiscNum:     1,
+				CreatedAt:   now,
+			},
+			store.Track{
+				ID:          "tr_default_src",
+				Source:      "",
+				RelPath:     defaultRelPath,
+				FileSize:    1500,
+				MtimeNs:     3,
+				Title:       "Shared Song Default",
+				Artist:      "Shared Artist",
+				AlbumArtist: "Shared Artist",
+				Album:       "Shared Album",
+				TrackNum:    3,
+				DiscNum:     1,
+				CreatedAt:   now,
+			},
+		)
+
+		albumID := store.AlbumID("Shared Artist", "Shared Album")
+		h := newLibraryHandler(t, st, nil)
+
+		wantPaths := map[string]string{
+			"tr_music_shared":  sharedRelPath,
+			"tr_upload_shared": "uploads/" + sharedRelPath,
+			"tr_default_src":   defaultRelPath,
+		}
+
+		for id, wantPath := range wantPaths {
+			_, xmlBody := execSubsonicRequest(t, h, http.MethodGet, "/rest/getSong?id="+id, "")
+			assertNoCoverArt(t, xmlBody)
+			env := decodeXML(t, xmlBody)
+			if env.Song == nil {
+				t.Fatalf("getSong(%s) XML Song = nil", id)
+			}
+			if env.Song.Path != wantPath {
+				t.Errorf("getSong(%s) XML Path = %q, want %q", id, env.Song.Path, wantPath)
+			}
+
+			_, jsonBody := execSubsonicRequest(t, h, http.MethodGet, "/rest/getSong?f=json&id="+id, "")
+			assertNoCoverArt(t, jsonBody)
+			songMap := mustJSONMap(t, decodeJSON(t, jsonBody), "song")
+			if got := mustJSONString(t, songMap, "path"); got != wantPath {
+				t.Errorf("getSong(%s) JSON path = %q, want %q", id, got, wantPath)
+			}
+		}
+
+		_, albumXML := execSubsonicRequest(t, h, http.MethodGet, "/rest/getAlbum?id="+albumID, "")
+		assertNoCoverArt(t, albumXML)
+		albumEnv := decodeXML(t, albumXML)
+		if albumEnv.Album == nil {
+			t.Fatalf("getAlbum XML Album = nil")
+		}
+		assertChildPaths(t, albumEnv.Album.Song, wantPaths)
+
+		_, albumJSON := execSubsonicRequest(t, h, http.MethodGet, "/rest/getAlbum?f=json&id="+albumID, "")
+		assertNoCoverArt(t, albumJSON)
+		albumObj := mustJSONMap(t, decodeJSON(t, albumJSON), "album")
+		assertJSONChildPaths(t, mustJSONSlice(t, albumObj, "song"), wantPaths)
+
+		_, searchXML := execSubsonicRequest(t, h, http.MethodGet, "/rest/search3?query=Shared", "")
+		assertNoCoverArt(t, searchXML)
+		searchEnv := decodeXML(t, searchXML)
+		if searchEnv.SearchResult3 == nil {
+			t.Fatalf("search3 XML SearchResult3 = nil")
+		}
+		assertChildPaths(t, searchEnv.SearchResult3.Song, wantPaths)
+
+		_, searchJSON := execSubsonicRequest(t, h, http.MethodGet, "/rest/search3?f=json&query=Shared", "")
+		assertNoCoverArt(t, searchJSON)
+		sr := mustJSONMap(t, decodeJSON(t, searchJSON), "searchResult3")
+		assertJSONChildPaths(t, mustJSONSlice(t, sr, "song"), wantPaths)
+	})
+
+	t.Run("empty Source without store normalization", func(t *testing.T) {
+		tracks := []store.Track{
+			{
+				ID:          "tr_empty",
+				Source:      "",
+				RelPath:     sharedRelPath,
+				Title:       "Empty Source",
+				Artist:      "Artist",
+				AlbumArtist: "Artist",
+				ArtistID:    "ar_1",
+				Album:       "Album",
+				AlbumID:     "al_1",
+			},
+			{
+				ID:          "tr_uploads",
+				Source:      store.SourceUploads,
+				RelPath:     sharedRelPath,
+				Title:       "Uploads Source",
+				Artist:      "Artist",
+				AlbumArtist: "Artist",
+				ArtistID:    "ar_1",
+				Album:       "Album",
+				AlbumID:     "al_1",
+			},
+		}
+		spy := &spyLibraryStore{
+			album: store.AlbumSummary{
+				ID:        "al_1",
+				Name:      "Album",
+				Artist:    "Artist",
+				ArtistID:  "ar_1",
+				SongCount: len(tracks),
+			},
+			albumTracks: tracks,
+			track:       &tracks[0],
+			search3Out: store.Search3Result{
+				Artists: []store.ArtistSummary{},
+				Albums:  []store.AlbumSummary{},
+				Songs:   tracks,
+			},
+		}
+		h := newLibraryHandler(t, spy, nil)
+
+		wantPaths := map[string]string{
+			"tr_empty":   sharedRelPath,
+			"tr_uploads": "uploads/" + sharedRelPath,
+		}
+
+		_, songXML := execSubsonicRequest(t, h, http.MethodGet, "/rest/getSong?id=tr_empty", "")
+		if got := decodeXML(t, songXML).Song.Path; got != sharedRelPath {
+			t.Errorf("getSong empty source XML Path = %q, want %q", got, sharedRelPath)
+		}
+		_, songJSON := execSubsonicRequest(t, h, http.MethodGet, "/rest/getSong?f=json&id=tr_empty", "")
+		if got := mustJSONString(t, mustJSONMap(t, decodeJSON(t, songJSON), "song"), "path"); got != sharedRelPath {
+			t.Errorf("getSong empty source JSON path = %q, want %q", got, sharedRelPath)
+		}
+
+		_, albumXML := execSubsonicRequest(t, h, http.MethodGet, "/rest/getAlbum?id=al_1", "")
+		assertChildPaths(t, decodeXML(t, albumXML).Album.Song, wantPaths)
+		_, albumJSON := execSubsonicRequest(t, h, http.MethodGet, "/rest/getAlbum?f=json&id=al_1", "")
+		assertJSONChildPaths(t, mustJSONSlice(t, mustJSONMap(t, decodeJSON(t, albumJSON), "album"), "song"), wantPaths)
+
+		_, searchXML := execSubsonicRequest(t, h, http.MethodGet, "/rest/search3?query=Source", "")
+		assertChildPaths(t, decodeXML(t, searchXML).SearchResult3.Song, wantPaths)
+		_, searchJSON := execSubsonicRequest(t, h, http.MethodGet, "/rest/search3?f=json&query=Source", "")
+		assertJSONChildPaths(t, mustJSONSlice(t, mustJSONMap(t, decodeJSON(t, searchJSON), "searchResult3"), "song"), wantPaths)
+	})
 }

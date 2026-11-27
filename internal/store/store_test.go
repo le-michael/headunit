@@ -116,7 +116,7 @@ func TestOpenAndClose(t *testing.T) {
 			{"PRAGMA synchronous", 1}, // NORMAL
 			{"PRAGMA foreign_keys", 1},
 			{"PRAGMA busy_timeout", 5000},
-			{"PRAGMA user_version", 2},
+			{"PRAGMA user_version", 3},
 		}
 		for _, tc := range writeIntPragmas {
 			var got int
@@ -259,7 +259,7 @@ func TestOpenAndClose(t *testing.T) {
 		}
 	})
 
-	t.Run("migrates v1 database to v2 preserving tracks", func(t *testing.T) {
+	t.Run("migrates v1 database to v3 preserving tracks", func(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "v1.db")
 		rawDB, err := sql.Open("sqlite", buildDSN(dbPath, writeDSNQuery))
 		if err != nil {
@@ -292,7 +292,7 @@ func TestOpenAndClose(t *testing.T) {
 
 		s, err := Open(ctx, dbPath)
 		if err != nil {
-			t.Fatalf("Open() v1->v2 migration error: %v", err)
+			t.Fatalf("Open() v1->v3 migration error: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Close() })
 
@@ -300,11 +300,13 @@ func TestOpenAndClose(t *testing.T) {
 		if err := s.readDB.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 			t.Fatalf("PRAGMA user_version error: %v", err)
 		}
-		if version != 2 {
-			t.Errorf("migrated user_version = %d, want 2", version)
+		if version != 3 {
+			t.Errorf("migrated user_version = %d, want 3", version)
 		}
 
 		for name, wantType := range map[string]string{
+			"idx_tracks_artist_id": "index",
+			"idx_tracks_album_id":  "index",
 			"users":                "table",
 			"api_keys":             "table",
 			"idx_api_keys_user_id": "index",
@@ -329,13 +331,137 @@ func TestOpenAndClose(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetTrack(tr_v1_legacy) after migration error: %v", err)
 		}
-		if got.Title != "Ready Lets Go" || got.RelPath != "boc/geogaddi/01.flac" {
-			t.Errorf("migrated track = %+v, want preserved v1 fields", *got)
+		if got.Title != "Ready Lets Go" || got.RelPath != "boc/geogaddi/01.flac" || got.Source != SourceMusic {
+			t.Errorf("migrated track = %+v, want preserved v1 fields with SourceMusic", *got)
+		}
+	})
+
+	t.Run("migrates v2 database to v3 preserving tracks, users, api keys, and indexes", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "v2.db")
+		rawDB, err := sql.Open("sqlite", buildDSN(dbPath, writeDSNQuery))
+		if err != nil {
+			t.Fatalf("raw sql.Open() error: %v", err)
+		}
+		for _, stmt := range schemaV1Statements {
+			if _, err := rawDB.ExecContext(ctx, stmt.sql); err != nil {
+				_ = rawDB.Close()
+				t.Fatalf("seed v1 %s: %v", stmt.name, err)
+			}
+		}
+		for _, stmt := range schemaV2Statements {
+			if _, err := rawDB.ExecContext(ctx, stmt.sql); err != nil {
+				_ = rawDB.Close()
+				t.Fatalf("seed v2 %s: %v", stmt.name, err)
+			}
+		}
+		seedArtistID := ArtistID("Boards of Canada")
+		seedAlbumID := AlbumID("Boards of Canada", "Geogaddi")
+		if _, err := rawDB.ExecContext(ctx,
+			`INSERT INTO tracks (
+				id, rel_path, file_size, mtime_ns, title, artist, album_artist,
+				artist_id, album, album_id, track_num, disc_num, year, genre,
+				duration_sec, bit_rate, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			"tr_v2_legacy", "boc/geogaddi/02.flac", 4096, 1700000001, "Music Is Math",
+			"Boards of Canada", "Boards of Canada", seedArtistID, "Geogaddi", seedAlbumID,
+			2, 1, 2002, "IDM", 321, 950, "2025-02-01T08:30:00Z",
+		); err != nil {
+			_ = rawDB.Close()
+			t.Fatalf("seed v2 track: %v", err)
+		}
+		if _, err := rawDB.ExecContext(ctx,
+			`INSERT INTO users (id, username, password_ciphertext, is_admin, disabled, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			"usr_v2_admin", "admin", []byte("cipher-blob"), 1, 0, "2025-02-01T08:00:00Z", "2025-02-01T08:00:00Z",
+		); err != nil {
+			_ = rawDB.Close()
+			t.Fatalf("seed v2 user: %v", err)
+		}
+		if _, err := rawDB.ExecContext(ctx,
+			`INSERT INTO api_keys (id, user_id, name, key_prefix, key_hash, created_at, revoked_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			"key_v2_1", "usr_v2_admin", "phone", "hu_1234", "deadbeefhash", "2025-02-01T08:05:00Z", "",
+		); err != nil {
+			_ = rawDB.Close()
+			t.Fatalf("seed v2 api_key: %v", err)
+		}
+		if err := rawDB.Close(); err != nil {
+			t.Fatalf("raw Close() error: %v", err)
+		}
+
+		s, err := Open(ctx, dbPath)
+		if err != nil {
+			t.Fatalf("Open() v2->v3 migration error: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+
+		var version int
+		if err := s.readDB.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+			t.Fatalf("PRAGMA user_version error: %v", err)
+		}
+		if version != 3 {
+			t.Errorf("migrated user_version = %d, want 3", version)
+		}
+
+		for name, wantType := range map[string]string{
+			"tracks":               "table",
+			"idx_tracks_artist_id": "index",
+			"idx_tracks_album_id":  "index",
+			"users":                "table",
+			"api_keys":             "table",
+			"idx_api_keys_user_id": "index",
+		} {
+			var gotType string
+			if err := s.readDB.QueryRowContext(ctx, "SELECT type FROM sqlite_master WHERE name = ?", name).Scan(&gotType); err != nil {
+				t.Fatalf("sqlite_master lookup for %q failed: %v", name, err)
+			}
+			if gotType != wantType {
+				t.Errorf("sqlite_master[%q] type = %q, want %q", name, gotType, wantType)
+			}
+		}
+
+		gotTrack, err := s.GetTrack(ctx, "tr_v2_legacy")
+		if err != nil {
+			t.Fatalf("GetTrack(tr_v2_legacy) error: %v", err)
+		}
+		if gotTrack.ID != "tr_v2_legacy" || gotTrack.Source != SourceMusic || gotTrack.RelPath != "boc/geogaddi/02.flac" ||
+			gotTrack.Title != "Music Is Math" || !gotTrack.CreatedAt.Equal(time.Date(2025, 2, 1, 8, 30, 0, 0, time.UTC)) {
+			t.Errorf("migrated v2 track = %+v, want preserved fields and SourceMusic", *gotTrack)
+		}
+
+		gotUser, err := s.GetUserByUsername(ctx, "admin")
+		if err != nil {
+			t.Fatalf("GetUserByUsername(admin) after migration error: %v", err)
+		}
+		if gotUser.ID != "usr_v2_admin" || !gotUser.IsAdmin {
+			t.Errorf("migrated v2 user = %+v, want usr_v2_admin", *gotUser)
+		}
+
+		gotKey, err := s.LookupAPIKeyByHash(ctx, "deadbeefhash")
+		if err != nil {
+			t.Fatalf("LookupAPIKeyByHash() after migration error: %v", err)
+		}
+		if gotKey.Key.ID != "key_v2_1" || gotKey.Key.UserID != "usr_v2_admin" {
+			t.Errorf("migrated v2 api_key = %+v, want key_v2_1", gotKey)
+		}
+
+		// Verify UNIQUE(source, rel_path) allows an uploaded track at the same rel_path.
+		uploadDup := makeTrack("boc/geogaddi/02.flac", "Upload Copy", "Boards of Canada", "Boards of Canada", "Geogaddi", time.Date(2025, 2, 2, 0, 0, 0, 0, time.UTC))
+		uploadDup.ID = "tr_v3_upload_dup"
+		uploadDup.Source = SourceUploads
+		mustUpsert(t, s, uploadDup)
+
+		count, err := s.TrackCount(ctx)
+		if err != nil {
+			t.Fatalf("TrackCount() error: %v", err)
+		}
+		if count != 2 {
+			t.Errorf("TrackCount() = %d, want 2", count)
 		}
 	})
 
 	t.Run("rejects unsupported schema versions", func(t *testing.T) {
-		for _, badVersion := range []int{-1, 3} {
+		for _, badVersion := range []int{-1, 4} {
 			t.Run(fmt.Sprintf("user_version_%d", badVersion), func(t *testing.T) {
 				dbPath := filepath.Join(t.TempDir(), "badver.db")
 				s, err := Open(ctx, dbPath)
@@ -519,7 +645,7 @@ func TestUpsertTrack_InPlaceEditAndValidation(t *testing.T) {
 		t.Errorf("UpsertTrack() mutated caller Track:\ngot:  %+v\nwant: %+v", input, inputBefore)
 	}
 
-	snaps, err := s.LoadSnapshots(ctx)
+	snaps, err := s.LoadSnapshots(ctx, SourceMusic)
 	if err != nil {
 		t.Fatalf("LoadSnapshots() error: %v", err)
 	}
@@ -538,6 +664,7 @@ func TestUpsertTrack_InPlaceEditAndValidation(t *testing.T) {
 	wantCreated := origCreated.UTC().Truncate(time.Second)
 	want := Track{
 		ID:          snap.ID,
+		Source:      SourceMusic,
 		RelPath:     input.RelPath,
 		FileSize:    input.FileSize,
 		MtimeNs:     input.MtimeNs,
@@ -597,6 +724,7 @@ func TestUpsertTrack_InPlaceEditAndValidation(t *testing.T) {
 	}
 	wantEdited := Track{
 		ID:          snap.ID, // preserved
+		Source:      SourceMusic,
 		RelPath:     updated.RelPath,
 		FileSize:    updated.FileSize,
 		MtimeNs:     updated.MtimeNs,
@@ -725,7 +853,7 @@ func TestBrowseQueries_GroupingAndAggregates(t *testing.T) {
 			DurationSec: 151, BitRate: 800, CreatedAt: t1,
 		},
 	}
-	if err := s.ApplyScanBatch(ctx, seed, nil); err != nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, seed, nil); err != nil {
 		t.Fatalf("ApplyScanBatch() seed error: %v", err)
 	}
 
@@ -850,7 +978,8 @@ func TestBrowseQueries_GroupingAndAggregates(t *testing.T) {
 			_, err := s.Search3(ctx, Search3Query{Query: "Roygbiv", SongCount: 10})
 			return err
 		}},
-		{"LoadSnapshots", func() error { _, err := s.LoadSnapshots(ctx); return err }},
+		{"LoadSnapshots", func() error { _, err := s.LoadSnapshots(ctx, SourceMusic); return err }},
+		{"GetTrackBySourceRelPath", func() error { _, err := s.GetTrackBySourceRelPath(ctx, SourceMusic, "boc/01.flac"); return err }},
 	}
 	for _, tc := range corruptChecks {
 		t.Run("corrupt_created_at_"+tc.name, func(t *testing.T) {
@@ -897,7 +1026,7 @@ func TestListAlbums(t *testing.T) {
 		makeTrack("c/1.mp3", "C1", "Bravo", "Bravo", "Echoes", t20),
 		makeTrack("d/1.mp3", "D1", "alpha", "alpha", "echoes", t20),
 	}
-	if err := s.ApplyScanBatch(ctx, seed, nil); err != nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, seed, nil); err != nil {
 		t.Fatalf("ApplyScanBatch() seed error: %v", err)
 	}
 
@@ -1013,7 +1142,7 @@ func TestListAlbums(t *testing.T) {
 				baseTime.Add(time.Duration(i)*time.Second),
 			)
 		}
-		if err := sLarge.ApplyScanBatch(ctx, batch, nil); err != nil {
+		if err := sLarge.ApplyScanBatch(ctx, SourceMusic, batch, nil); err != nil {
 			t.Fatalf("ApplyScanBatch(%d) error: %v", total, err)
 		}
 
@@ -1072,7 +1201,7 @@ func TestSearch3(t *testing.T) {
 			Album: "Mix Tape", DurationSec: 150, CreatedAt: ts,
 		},
 	}
-	if err := s.ApplyScanBatch(ctx, seed, nil); err != nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, seed, nil); err != nil {
 		t.Fatalf("ApplyScanBatch() seed error: %v", err)
 	}
 
@@ -1346,7 +1475,7 @@ func TestSearch3(t *testing.T) {
 				ts,
 			)
 		}
-		if err := sLarge.ApplyScanBatch(ctx, batch, nil); err != nil {
+		if err := sLarge.ApplyScanBatch(ctx, SourceMusic, batch, nil); err != nil {
 			t.Fatalf("ApplyScanBatch(%d) error: %v", total, err)
 		}
 
@@ -1370,7 +1499,7 @@ func TestDeletesAndSnapshots(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 
-	emptySnaps, err := s.LoadSnapshots(ctx)
+	emptySnaps, err := s.LoadSnapshots(ctx, SourceMusic)
 	if err != nil {
 		t.Fatalf("LoadSnapshots() on empty store error: %v", err)
 	}
@@ -1390,11 +1519,11 @@ func TestDeletesAndSnapshots(t *testing.T) {
 		{ID: "tr_wild_match", RelPath: "100%_Rock/dir_1/g.mp3", FileSize: 107, MtimeNs: 1007, Title: "G", Artist: "A", AlbumArtist: "A", Album: "A", CreatedAt: ts},
 		{ID: "tr_wild_other", RelPath: "1000XRock/dirX1/h.mp3", FileSize: 108, MtimeNs: 1008, Title: "H", Artist: "A", AlbumArtist: "A", Album: "A", CreatedAt: ts},
 	}
-	if err := s.ApplyScanBatch(ctx, tracks, nil); err != nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, tracks, nil); err != nil {
 		t.Fatalf("ApplyScanBatch() seed error: %v", err)
 	}
 
-	snaps, err := s.LoadSnapshots(ctx)
+	snaps, err := s.LoadSnapshots(ctx, SourceMusic)
 	if err != nil {
 		t.Fatalf("LoadSnapshots() error: %v", err)
 	}
@@ -1414,14 +1543,14 @@ func TestDeletesAndSnapshots(t *testing.T) {
 
 	// DeleteByRelPath: invalid paths rejected, absent valid path is idempotent, existing path deleted.
 	for _, bad := range []string{"", ".", "../a.mp3", "/Rock/a.mp3", "Rock/"} {
-		if err := s.DeleteByRelPath(ctx, bad); err == nil {
+		if err := s.DeleteByRelPath(ctx, SourceMusic, bad); err == nil {
 			t.Errorf("DeleteByRelPath(%q) = nil error, want error", bad)
 		}
 	}
-	if err := s.DeleteByRelPath(ctx, "Does/Not/Exist.mp3"); err != nil {
+	if err := s.DeleteByRelPath(ctx, SourceMusic, "Does/Not/Exist.mp3"); err != nil {
 		t.Fatalf("DeleteByRelPath(absent) error: %v", err)
 	}
-	if err := s.DeleteByRelPath(ctx, "Rock.mp3"); err != nil {
+	if err := s.DeleteByRelPath(ctx, SourceMusic, "Rock.mp3"); err != nil {
 		t.Fatalf("DeleteByRelPath(Rock.mp3) error: %v", err)
 	}
 	if _, err := s.GetTrack(ctx, "tr_rockfile"); !errors.Is(err, ErrNotFound) {
@@ -1443,26 +1572,26 @@ func TestDeletesAndSnapshots(t *testing.T) {
 		"Rock//Pop",
 	}
 	for _, bad := range badPrefixes {
-		if err := s.DeleteByDirPrefix(ctx, bad); err == nil {
+		if err := s.DeleteByDirPrefix(ctx, SourceMusic, bad); err == nil {
 			t.Errorf("DeleteByDirPrefix(%q) = nil error, want error", bad)
 		}
 	}
 
 	// Delete "Rock/" (trailing slash normalized) leaves Rock2/, Rock0/, Rock-Classic/ untouched.
-	if err := s.DeleteByDirPrefix(ctx, "Rock/"); err != nil {
+	if err := s.DeleteByDirPrefix(ctx, SourceMusic, "Rock/"); err != nil {
 		t.Fatalf("DeleteByDirPrefix(Rock/) error: %v", err)
 	}
 	// Idempotent delete on already-empty directory.
-	if err := s.DeleteByDirPrefix(ctx, "Rock///"); err != nil {
+	if err := s.DeleteByDirPrefix(ctx, SourceMusic, "Rock///"); err != nil {
 		t.Fatalf("DeleteByDirPrefix(Rock///) idempotent error: %v", err)
 	}
 
 	// Delete literal % and _ directory name leaves look-alike sibling untouched.
-	if err := s.DeleteByDirPrefix(ctx, "100%_Rock/dir_1"); err != nil {
+	if err := s.DeleteByDirPrefix(ctx, SourceMusic, "100%_Rock/dir_1"); err != nil {
 		t.Fatalf("DeleteByDirPrefix(100%%_Rock/dir_1) error: %v", err)
 	}
 
-	remaining, err := s.LoadSnapshots(ctx)
+	remaining, err := s.LoadSnapshots(ctx, SourceMusic)
 	if err != nil {
 		t.Fatalf("LoadSnapshots() after deletes error: %v", err)
 	}
@@ -1488,7 +1617,7 @@ func TestApplyScanBatch_Atomicity(t *testing.T) {
 	s := openTestStore(t)
 
 	// Empty batch is a no-op.
-	if err := s.ApplyScanBatch(ctx, nil, nil); err != nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, nil, nil); err != nil {
 		t.Fatalf("ApplyScanBatch(nil, nil) error: %v", err)
 	}
 
@@ -1500,7 +1629,7 @@ func TestApplyScanBatch_Atomicity(t *testing.T) {
 		{ID: "tr_keep", RelPath: "keep.mp3", FileSize: 20, MtimeNs: 2, Title: "Keep", Artist: "A", AlbumArtist: "A", Album: "Al", CreatedAt: t1},
 		{ID: "tr_fixed", RelPath: "fixed.mp3", FileSize: 30, MtimeNs: 3, Title: "Fixed", Artist: "A", AlbumArtist: "A", Album: "Al", CreatedAt: t1},
 	}
-	if err := s.ApplyScanBatch(ctx, seed, nil); err != nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, seed, nil); err != nil {
 		t.Fatalf("ApplyScanBatch(seed) error: %v", err)
 	}
 
@@ -1523,7 +1652,7 @@ func TestApplyScanBatch_Atomicity(t *testing.T) {
 	}
 	upsertsCopy := append([]Track(nil), upserts...)
 
-	if err := s.ApplyScanBatch(ctx, upserts, []string{"reinsert.mp3"}); err != nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, upserts, []string{"reinsert.mp3"}); err != nil {
 		t.Fatalf("ApplyScanBatch(delete+reinsert) error: %v", err)
 	}
 	if !reflect.DeepEqual(upserts, upsertsCopy) {
@@ -1532,7 +1661,7 @@ func TestApplyScanBatch_Atomicity(t *testing.T) {
 	if _, err := s.GetTrack(ctx, "tr_old"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetTrack(tr_old) after delete+reinsert = %v, want ErrNotFound", err)
 	}
-	snaps, err := s.LoadSnapshots(ctx)
+	snaps, err := s.LoadSnapshots(ctx, SourceMusic)
 	if err != nil {
 		t.Fatalf("LoadSnapshots() error: %v", err)
 	}
@@ -1545,16 +1674,16 @@ func TestApplyScanBatch_Atomicity(t *testing.T) {
 	}
 
 	// Pre-transaction validation failures leave DB untouched.
-	if err := s.ApplyScanBatch(ctx, []Track{makeTrack("new_never.mp3", "X", "X", "X", "X", t2)}, []string{"/bad/delete.mp3"}); err == nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, []Track{makeTrack("new_never.mp3", "X", "X", "X", "X", t2)}, []string{"/bad/delete.mp3"}); err == nil {
 		t.Fatalf("ApplyScanBatch(bad delete path) = nil error, want error")
 	}
-	if err := s.ApplyScanBatch(ctx, []Track{makeTrack("../bad_upsert.mp3", "X", "X", "X", "X", t2)}, []string{"keep.mp3"}); err == nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, []Track{makeTrack("../bad_upsert.mp3", "X", "X", "X", "X", t2)}, []string{"keep.mp3"}); err == nil {
 		t.Fatalf("ApplyScanBatch(bad upsert path) = nil error, want error")
 	}
 	if _, err := s.GetTrack(ctx, "tr_keep"); err != nil {
 		t.Fatalf("tr_keep missing after pre-tx validation failure: %v", err)
 	}
-	afterBadSnaps, err := s.LoadSnapshots(ctx)
+	afterBadSnaps, err := s.LoadSnapshots(ctx, SourceMusic)
 	if err != nil {
 		t.Fatalf("LoadSnapshots() after pre-tx failure error: %v", err)
 	}
@@ -1567,7 +1696,7 @@ func TestApplyScanBatch_Atomicity(t *testing.T) {
 		{ID: "tr_should_rollback", RelPath: "rollback.mp3", FileSize: 1, MtimeNs: 1, Title: "Roll", Artist: "A", AlbumArtist: "A", Album: "Al", CreatedAt: t2},
 		{ID: "tr_fixed", RelPath: "different_path_same_id.mp3", FileSize: 1, MtimeNs: 1, Title: "Collide", Artist: "A", AlbumArtist: "A", Album: "Al", CreatedAt: t2},
 	}
-	if err := s.ApplyScanBatch(ctx, collidingBatch, []string{"keep.mp3"}); err == nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, collidingBatch, []string{"keep.mp3"}); err == nil {
 		t.Fatalf("ApplyScanBatch(PK collision) = nil error, want error")
 	}
 	if _, err := s.GetTrack(ctx, "tr_keep"); err != nil {
@@ -1578,7 +1707,7 @@ func TestApplyScanBatch_Atomicity(t *testing.T) {
 	}
 
 	// Delete-only batch succeeds without upserts.
-	if err := s.ApplyScanBatch(ctx, nil, []string{"keep.mp3"}); err != nil {
+	if err := s.ApplyScanBatch(ctx, SourceMusic, nil, []string{"keep.mp3"}); err != nil {
 		t.Fatalf("ApplyScanBatch(delete-only) error: %v", err)
 	}
 	if _, err := s.GetTrack(ctx, "tr_keep"); !errors.Is(err, ErrNotFound) {
@@ -1794,22 +1923,22 @@ func TestConcurrency_WALIsolationAndRace(t *testing.T) {
 						}
 					} else {
 						prevPath := fmt.Sprintf("worker_%d/track_%d.mp3", writerID, i-1)
-						if err := s.ApplyScanBatch(ctx, []Track{tr}, []string{prevPath}); err != nil {
+						if err := s.ApplyScanBatch(ctx, SourceMusic, []Track{tr}, []string{prevPath}); err != nil {
 							errCh <- fmt.Errorf("writer %d iter %d ApplyScanBatch: %w", writerID, i, err)
 							return
 						}
-						if err := s.DeleteByRelPath(ctx, relPath); err != nil {
+						if err := s.DeleteByRelPath(ctx, SourceMusic, relPath); err != nil {
 							errCh <- fmt.Errorf("writer %d iter %d DeleteByRelPath: %w", writerID, i, err)
 							return
 						}
 						if i%5 == 0 {
-							if err := s.DeleteByDirPrefix(ctx, fmt.Sprintf("worker_%d", writerID)); err != nil {
+							if err := s.DeleteByDirPrefix(ctx, SourceMusic, fmt.Sprintf("worker_%d", writerID)); err != nil {
 								errCh <- fmt.Errorf("writer %d iter %d DeleteByDirPrefix: %w", writerID, i, err)
 								return
 							}
 						}
 					}
-					if _, err := s.LoadSnapshots(ctx); err != nil {
+					if _, err := s.LoadSnapshots(ctx, SourceMusic); err != nil {
 						errCh <- fmt.Errorf("writer %d iter %d LoadSnapshots: %w", writerID, i, err)
 						return
 					}
@@ -1823,6 +1952,223 @@ func TestConcurrency_WALIsolationAndRace(t *testing.T) {
 
 		for err := range errCh {
 			t.Error(err)
+		}
+	})
+}
+
+func TestMultiSourceIsolationAndLookup(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	ts := time.Date(2025, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("invalid source rejected across write and lookup methods", func(t *testing.T) {
+		for _, badSource := range []string{"other", "MUSIC", "upload", "music "} {
+			badTrack := makeTrack("a.mp3", "T", "A", "A", "Al", ts)
+			badTrack.Source = badSource
+			if err := s.UpsertTrack(ctx, &badTrack); err == nil {
+				t.Errorf("UpsertTrack(source=%q) = nil error, want error", badSource)
+			}
+			if _, err := s.LoadSnapshots(ctx, badSource); err == nil {
+				t.Errorf("LoadSnapshots(source=%q) = nil error, want error", badSource)
+			}
+			if _, err := s.GetTrackBySourceRelPath(ctx, badSource, "a.mp3"); err == nil {
+				t.Errorf("GetTrackBySourceRelPath(source=%q) = nil error, want error", badSource)
+			}
+			if err := s.DeleteByRelPath(ctx, badSource, "a.mp3"); err == nil {
+				t.Errorf("DeleteByRelPath(source=%q) = nil error, want error", badSource)
+			}
+			if err := s.DeleteByDirPrefix(ctx, badSource, "dir"); err == nil {
+				t.Errorf("DeleteByDirPrefix(source=%q) = nil error, want error", badSource)
+			}
+			if err := s.ApplyScanBatch(ctx, badSource, nil, nil); err == nil {
+				t.Errorf("ApplyScanBatch(empty, source=%q) = nil error, want error", badSource)
+			}
+		}
+
+		// Batch with track source disagreeing with batch source is rejected pre-tx without mutating caller slice or DB.
+		mismatched := []Track{
+			{ID: "tr_mismatch", Source: SourceUploads, RelPath: "shared/01.mp3", FileSize: 1, MtimeNs: 1, Title: "T", Artist: "A", AlbumArtist: "A", Album: "Al", CreatedAt: ts},
+		}
+		mismatchedCopy := append([]Track(nil), mismatched...)
+		if err := s.ApplyScanBatch(ctx, SourceMusic, mismatched, nil); err == nil {
+			t.Fatalf("ApplyScanBatch(SourceMusic, track.Source=SourceUploads) = nil error, want error")
+		}
+		if !reflect.DeepEqual(mismatched, mismatchedCopy) {
+			t.Errorf("ApplyScanBatch mutated mismatched caller slice: got %+v, want %+v", mismatched, mismatchedCopy)
+		}
+		if count, err := s.TrackCount(ctx); err != nil || count != 0 {
+			t.Errorf("TrackCount() after mismatched batch = (%d, %v), want (0, nil)", count, err)
+		}
+	})
+
+	t.Run("same rel_path coexists across sources and mutations stay isolated", func(t *testing.T) {
+		sharedRel := "Artist/Album/01.mp3"
+		musicTrack := Track{
+			RelPath: sharedRel, FileSize: 100, MtimeNs: 1000,
+			Title: "Music Version", Artist: "Shared Artist", AlbumArtist: "Shared Artist",
+			Album: "Shared Album", TrackNum: 1, DiscNum: 1, DurationSec: 180, CreatedAt: ts,
+		} // empty Source defaults to SourceMusic
+		uploadTrack := Track{
+			Source: SourceUploads, RelPath: sharedRel, FileSize: 200, MtimeNs: 2000,
+			Title: "Upload Version", Artist: "Shared Artist", AlbumArtist: "Shared Artist",
+			Album: "Shared Album", TrackNum: 2, DiscNum: 1, DurationSec: 240, CreatedAt: ts.Add(time.Minute),
+		}
+		if err := s.UpsertTrack(ctx, &musicTrack); err != nil {
+			t.Fatalf("UpsertTrack(music) error: %v", err)
+		}
+		if err := s.UpsertTrack(ctx, &uploadTrack); err != nil {
+			t.Fatalf("UpsertTrack(uploads) error: %v", err)
+		}
+		// Empty Source on caller structs remains unmutated.
+		if musicTrack.Source != "" {
+			t.Errorf("UpsertTrack mutated caller Source to %q", musicTrack.Source)
+		}
+
+		// GetTrackBySourceRelPath resolves each root independently (and defaults "" -> SourceMusic).
+		gotMusic, err := s.GetTrackBySourceRelPath(ctx, "", sharedRel)
+		if err != nil {
+			t.Fatalf("GetTrackBySourceRelPath('', %q) error: %v", sharedRel, err)
+		}
+		gotUpload, err := s.GetTrackBySourceRelPath(ctx, SourceUploads, sharedRel)
+		if err != nil {
+			t.Fatalf("GetTrackBySourceRelPath(uploads, %q) error: %v", sharedRel, err)
+		}
+		if gotMusic.ID == "" || gotUpload.ID == "" || gotMusic.ID == gotUpload.ID {
+			t.Fatalf("expected distinct generated IDs, got music=%q upload=%q", gotMusic.ID, gotUpload.ID)
+		}
+		if gotMusic.Source != SourceMusic || gotMusic.Title != "Music Version" {
+			t.Errorf("gotMusic = %+v, want SourceMusic / Music Version", *gotMusic)
+		}
+		if gotUpload.Source != SourceUploads || gotUpload.Title != "Upload Version" {
+			t.Errorf("gotUpload = %+v, want SourceUploads / Upload Version", *gotUpload)
+		}
+
+		// Overwriting the upload track via empty ID or different ID preserves stable ID and CreatedAt.
+		overwriteUpload := Track{
+			ID:          "tr_ignored_overwrite_id",
+			Source:      SourceUploads,
+			RelPath:     sharedRel,
+			FileSize:    250,
+			MtimeNs:     3000,
+			Title:       "Upload Version v2",
+			Artist:      "Shared Artist",
+			AlbumArtist: "Shared Artist",
+			Album:       "Shared Album",
+			TrackNum:    2,
+			DiscNum:     1,
+			DurationSec: 245,
+			CreatedAt:   ts.Add(24 * time.Hour),
+		}
+		if err := s.UpsertTrack(ctx, &overwriteUpload); err != nil {
+			t.Fatalf("UpsertTrack(overwrite upload) error: %v", err)
+		}
+		gotUploadAfter, err := s.GetTrackBySourceRelPath(ctx, SourceUploads, sharedRel)
+		if err != nil {
+			t.Fatalf("GetTrackBySourceRelPath(uploads after overwrite) error: %v", err)
+		}
+		if gotUploadAfter.ID != gotUpload.ID || !gotUploadAfter.CreatedAt.Equal(gotUpload.CreatedAt) || gotUploadAfter.Title != "Upload Version v2" {
+			t.Errorf("upload overwrite = %+v, want preserved ID=%q CreatedAt=%v Title='Upload Version v2'",
+				*gotUploadAfter, gotUpload.ID, gotUpload.CreatedAt)
+		}
+
+		// Music track with same rel_path is completely untouched.
+		gotMusicAfter, err := s.GetTrackBySourceRelPath(ctx, SourceMusic, sharedRel)
+		if err != nil {
+			t.Fatalf("GetTrackBySourceRelPath(music after upload overwrite) error: %v", err)
+		}
+		if gotMusicAfter.ID != gotMusic.ID || gotMusicAfter.Title != "Music Version" {
+			t.Errorf("music track affected by upload overwrite: %+v", *gotMusicAfter)
+		}
+
+		// Browse queries aggregate across both sources and populate Track.Source.
+		if count, err := s.TrackCount(ctx); err != nil || count != 2 {
+			t.Errorf("TrackCount() = (%d, %v), want (2, nil)", count, err)
+		}
+		artists, err := s.ListArtists(ctx)
+		if err != nil || len(artists) != 1 || artists[0].AlbumCount != 1 {
+			t.Errorf("ListArtists() = (%+v, %v), want 1 artist with 1 album", artists, err)
+		}
+		_, artistAlbums, err := s.GetArtist(ctx, artists[0].ID)
+		if err != nil || len(artistAlbums) != 1 || artistAlbums[0].SongCount != 2 {
+			t.Errorf("GetArtist() albums = (%+v, %v), want 1 album with SongCount=2", artistAlbums, err)
+		}
+		albumSummary, albumTracks, err := s.GetAlbum(ctx, AlbumID("Shared Artist", "Shared Album"))
+		if err != nil || albumSummary.SongCount != 2 || len(albumTracks) != 2 {
+			t.Fatalf("GetAlbum() = (%+v, len=%d, %v), want 2 tracks", albumSummary, len(albumTracks), err)
+		}
+		if albumTracks[0].Source != SourceMusic || albumTracks[1].Source != SourceUploads {
+			t.Errorf("GetAlbum() track sources = [%q, %q], want [%q, %q]",
+				albumTracks[0].Source, albumTracks[1].Source, SourceMusic, SourceUploads)
+		}
+		searchRes, err := s.Search3(ctx, Search3Query{Query: "Version", ArtistCount: 10, AlbumCount: 10, SongCount: 10})
+		if err != nil || len(searchRes.Songs) != 2 {
+			t.Fatalf("Search3() = (%+v, %v), want 2 songs", searchRes, err)
+		}
+		sourcesSeen := map[string]bool{}
+		for _, song := range searchRes.Songs {
+			sourcesSeen[song.Source] = true
+		}
+		if !sourcesSeen[SourceMusic] || !sourcesSeen[SourceUploads] {
+			t.Errorf("Search3() sourcesSeen = %v, want both music and uploads", sourcesSeen)
+		}
+
+		// LoadSnapshots isolates per source.
+		musicSnaps, err := s.LoadSnapshots(ctx, SourceMusic)
+		if err != nil || len(musicSnaps) != 1 || musicSnaps[sharedRel].ID != gotMusic.ID {
+			t.Errorf("LoadSnapshots(music) = (%+v, %v), want only music track", musicSnaps, err)
+		}
+		uploadSnaps, err := s.LoadSnapshots(ctx, SourceUploads)
+		if err != nil || len(uploadSnaps) != 1 || uploadSnaps[sharedRel].ID != gotUpload.ID {
+			t.Errorf("LoadSnapshots(uploads) = (%+v, %v), want only upload track", uploadSnaps, err)
+		}
+
+		// DeleteByRelPath on SourceUploads leaves SourceMusic untouched.
+		if err := s.DeleteByRelPath(ctx, SourceUploads, sharedRel); err != nil {
+			t.Fatalf("DeleteByRelPath(uploads) error: %v", err)
+		}
+		if _, err := s.GetTrackBySourceRelPath(ctx, SourceUploads, sharedRel); !errors.Is(err, ErrNotFound) {
+			t.Errorf("GetTrackBySourceRelPath(uploads after delete) = %v, want ErrNotFound", err)
+		}
+		if _, err := s.GetTrackBySourceRelPath(ctx, SourceMusic, sharedRel); err != nil {
+			t.Errorf("GetTrackBySourceRelPath(music after upload delete) = %v, want nil", err)
+		}
+
+		// Re-seed uploads via ApplyScanBatch (including another file under Artist/Album/)
+		// and verify DeleteByDirPrefix + ApplyScanBatch deletes isolate strictly to target source.
+		batchUploads := []Track{
+			{RelPath: sharedRel, FileSize: 200, MtimeNs: 2000, Title: "U1", Artist: "Shared Artist", AlbumArtist: "Shared Artist", Album: "Shared Album", CreatedAt: ts},
+			{RelPath: "Artist/Album/02.mp3", FileSize: 201, MtimeNs: 2001, Title: "U2", Artist: "Shared Artist", AlbumArtist: "Shared Artist", Album: "Shared Album", CreatedAt: ts},
+		}
+		if err := s.ApplyScanBatch(ctx, SourceUploads, batchUploads, nil); err != nil {
+			t.Fatalf("ApplyScanBatch(uploads) error: %v", err)
+		}
+		if err := s.DeleteByDirPrefix(ctx, SourceUploads, "Artist"); err != nil {
+			t.Fatalf("DeleteByDirPrefix(uploads, Artist) error: %v", err)
+		}
+		if uSnaps, err := s.LoadSnapshots(ctx, SourceUploads); err != nil || len(uSnaps) != 0 {
+			t.Errorf("LoadSnapshots(uploads) after DeleteByDirPrefix = (%+v, %v), want empty", uSnaps, err)
+		}
+		if mSnaps, err := s.LoadSnapshots(ctx, SourceMusic); err != nil || len(mSnaps) != 1 {
+			t.Errorf("LoadSnapshots(music) after upload DeleteByDirPrefix = (%+v, %v), want 1 track", mSnaps, err)
+		}
+
+		// ApplyScanBatch delete in SourceUploads does not affect SourceMusic.
+		if err := s.ApplyScanBatch(ctx, SourceUploads, nil, []string{sharedRel}); err != nil {
+			t.Fatalf("ApplyScanBatch(uploads delete) error: %v", err)
+		}
+		if _, err := s.GetTrackBySourceRelPath(ctx, SourceMusic, sharedRel); err != nil {
+			t.Errorf("music track deleted by uploads ApplyScanBatch: %v", err)
+		}
+	})
+
+	t.Run("GetTrackBySourceRelPath rejects invalid relPath", func(t *testing.T) {
+		for _, badRel := range []string{"", ".", "../escape.mp3", "/abs.mp3"} {
+			_, err := s.GetTrackBySourceRelPath(ctx, SourceUploads, badRel)
+			if err == nil {
+				t.Errorf("GetTrackBySourceRelPath(%q) = nil error, want error", badRel)
+			} else if errors.Is(err, ErrNotFound) {
+				t.Errorf("GetTrackBySourceRelPath(%q) returned ErrNotFound, want validation error", badRel)
+			}
 		}
 	})
 }

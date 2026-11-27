@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"headunit/internal/metadata"
@@ -19,20 +20,44 @@ import (
 
 var _ Streamer = (*DirectStreamer)(nil)
 
-// DirectStreamer serves audio files directly from a confined music root
-// directory using os.Root and http.ServeContent. Callers should drain active
+type directConfig struct {
+	uploadsDir string
+}
+
+// DirectOption configures optional settings for NewDirectStreamer.
+type DirectOption func(*directConfig)
+
+// WithUploadsDir configures the optional confined os.Root directory for tracks
+// with Source == store.SourceUploads. An empty or whitespace-only dir is ignored.
+func WithUploadsDir(dir string) DirectOption {
+	return func(c *directConfig) {
+		c.uploadsDir = dir
+	}
+}
+
+// DirectStreamer serves audio files directly from confined per-source root
+// directories using os.Root and http.ServeContent. Callers should drain active
 // HTTP requests before calling Close; Close is nil-safe, idempotent, and safe
 // to call concurrently with Stream. All methods are safe for concurrent use.
 type DirectStreamer struct {
-	root *os.Root // immutable after NewDirectStreamer; synchronized internally by os.Root
+	roots  map[string]*os.Root // immutable after NewDirectStreamer; synchronized internally by os.Root
+	closed atomic.Bool
 }
 
-// NewDirectStreamer opens musicDir with os.OpenRoot to enforce path and
-// symlink confinement for all subsequent Stream calls.
-func NewDirectStreamer(musicDir string) (*DirectStreamer, error) {
+// NewDirectStreamer opens musicDir (and any optional uploads directory) with
+// os.OpenRoot to enforce path and symlink confinement for all subsequent
+// Stream calls.
+func NewDirectStreamer(musicDir string, opts ...DirectOption) (*DirectStreamer, error) {
 	trimmed := strings.TrimSpace(musicDir)
 	if trimmed == "" {
 		return nil, errors.New("stream: music directory must not be empty")
+	}
+
+	var cfg directConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 
 	absDir, err := filepath.Abs(trimmed)
@@ -40,16 +65,39 @@ func NewDirectStreamer(musicDir string) (*DirectStreamer, error) {
 		return nil, fmt.Errorf("stream: resolve music directory %q: %w", trimmed, err)
 	}
 
-	root, err := os.OpenRoot(absDir)
+	musicRoot, err := os.OpenRoot(absDir)
 	if err != nil {
 		return nil, fmt.Errorf("stream: open music root %q: %w", absDir, err)
 	}
 
-	return &DirectStreamer{root: root}, nil
+	roots := map[string]*os.Root{
+		store.SourceMusic: musicRoot,
+	}
+
+	if uploadsTrimmed := strings.TrimSpace(cfg.uploadsDir); uploadsTrimmed != "" {
+		absUploads, err := filepath.Abs(uploadsTrimmed)
+		if err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("stream: resolve uploads directory %q: %w", uploadsTrimmed, err),
+				musicRoot.Close(),
+			)
+		}
+		uploadsRoot, err := os.OpenRoot(absUploads)
+		if err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("stream: open uploads root %q: %w", absUploads, err),
+				musicRoot.Close(),
+			)
+		}
+		roots[store.SourceUploads] = uploadsRoot
+	}
+
+	return &DirectStreamer{roots: roots}, nil
 }
 
-// Stream serves track's backing audio file directly from the confined music
-// root with full HTTP Range, ETag, and conditional request support.
+// Stream serves track's backing audio file directly from the confined root
+// matching track.Source (defaulting empty Source to store.SourceMusic) with
+// full HTTP Range, ETag, and conditional request support.
 //
 // DirectStreamer ignores opts. Before modifying any response header or writing
 // any body bytes, Stream validates inputs, checks that the target path is a
@@ -58,7 +106,7 @@ func NewDirectStreamer(musicDir string) (*DirectStreamer, error) {
 // completely untouched; once headers are set and http.ServeContent is invoked,
 // Stream always returns nil.
 func (d *DirectStreamer) Stream(w http.ResponseWriter, r *http.Request, track *store.Track, _ StreamOptions) error {
-	if d == nil || d.root == nil {
+	if d == nil || len(d.roots) == 0 || d.closed.Load() {
 		return fmt.Errorf("stream: streamer is closed: %w", os.ErrClosed)
 	}
 	if w == nil {
@@ -71,6 +119,15 @@ func (d *DirectStreamer) Stream(w http.ResponseWriter, r *http.Request, track *s
 		return errors.New("stream: track must not be nil")
 	}
 
+	source := track.Source
+	if source == "" {
+		source = store.SourceMusic
+	}
+	root := d.roots[source]
+	if root == nil {
+		return fmt.Errorf("stream: track source %q not configured: %w", source, ErrFileNotFound)
+	}
+
 	relPath := track.RelPath
 	if err := validateRelPath(relPath); err != nil {
 		return err
@@ -78,7 +135,7 @@ func (d *DirectStreamer) Stream(w http.ResponseWriter, r *http.Request, track *s
 
 	// Pre-open Stat rejects non-regular files (such as FIFOs) before Open can
 	// block waiting for a peer writer.
-	preInfo, err := d.root.Stat(relPath)
+	preInfo, err := root.Stat(relPath)
 	if err != nil {
 		return classifyRootErr("stat", relPath, err)
 	}
@@ -86,7 +143,7 @@ func (d *DirectStreamer) Stream(w http.ResponseWriter, r *http.Request, track *s
 		return fmt.Errorf("stream: %q is not a regular file: %w", relPath, ErrFileNotFound)
 	}
 
-	f, err := d.root.Open(relPath)
+	f, err := root.Open(relPath)
 	if err != nil {
 		return classifyRootErr("open", relPath, err)
 	}
@@ -97,7 +154,7 @@ func (d *DirectStreamer) Stream(w http.ResponseWriter, r *http.Request, track *s
 	info, err := f.Stat()
 	if err != nil {
 		// Unwrap *os.PathError so f.Stat's underlying file path (which includes
-		// the host musicDir) is never leaked in Stream error messages.
+		// the host root dir) is never leaked in Stream error messages.
 		var pe *os.PathError
 		if errors.As(err, &pe) && pe.Err != nil {
 			return fmt.Errorf("stream: fstat %q: %w", relPath, pe.Err)
@@ -118,19 +175,29 @@ func (d *DirectStreamer) Stream(w http.ResponseWriter, r *http.Request, track *s
 	hdr := w.Header()
 	hdr.Set("Content-Type", contentType)
 	hdr.Set("X-Content-Type-Options", "nosniff")
-	hdr.Set("ETag", formatETag(track.ID, relPath, info.Size(), info.ModTime().UnixNano()))
+	hdr.Set("ETag", formatETag(source, track.ID, relPath, info.Size(), info.ModTime().UnixNano()))
 
 	http.ServeContent(w, r, path.Base(relPath), info.ModTime(), f)
 	return nil
 }
 
-// Close releases the underlying os.Root handle held by the DirectStreamer.
+// Close releases all underlying os.Root handles held by the DirectStreamer.
 // Close is nil-safe, idempotent, and safe to call concurrently with Stream.
 func (d *DirectStreamer) Close() error {
-	if d == nil || d.root == nil {
+	if d == nil {
 		return nil
 	}
-	return d.root.Close()
+	d.closed.Store(true)
+	if len(d.roots) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, root := range d.roots {
+		if root != nil {
+			errs = append(errs, root.Close())
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func validateRelPath(relPath string) error {
@@ -167,14 +234,14 @@ func isNotFoundRootErr(err error) bool {
 	return false
 }
 
-func formatETag(trackID, relPath string, size, modTimeNs int64) string {
+func formatETag(source, trackID, relPath string, size, modTimeNs int64) string {
 	tag := trackID
 	if !isValidETagToken(trackID) {
-		source := trackID
-		if source == "" {
-			source = relPath
+		key := source + ":" + relPath
+		if trackID != "" {
+			key = source + ":" + trackID + ":" + relPath
 		}
-		sum := sha256.Sum256([]byte(source))
+		sum := sha256.Sum256([]byte(key))
 		tag = hex.EncodeToString(sum[:8])
 	}
 	return fmt.Sprintf("\"%s-%d-%d\"", tag, size, modTimeNs)
