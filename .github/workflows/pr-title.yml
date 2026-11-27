@@ -1,0 +1,37 @@
+name: PR Title
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    name: PR Title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate Conventional Commits PR title
+        shell: bash
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          LC_ALL=C
+          title="${PR_TITLE:-}"
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9]([a-z0-9._/-]*[a-z0-9])?\))?!?: [^[:space:]].*$'
+
+          if [[ "$title" == *$'\n'* || "$title" == *$'\r'* || ! "$title" =~ $pattern ]]; then
+            printf '::error::PR title must follow Conventional Commits: <type>[optional (scope)][!]: <description>. Allowed types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert. Example: '\''ci: add GitHub Actions workflows'\''.\n'
+            printf 'Received PR_TITLE=%q\n' "$title" >&2
+            exit 1
+          fi

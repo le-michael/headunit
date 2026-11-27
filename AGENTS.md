@@ -8,8 +8,9 @@ Run from the repository root once the Go module and Docker setup are in place:
 
 - Build static binary: `CGO_ENABLED=0 go build ./cmd/headunit`
 - Run full test suite: `go test -race ./...`
+- Run Docker Compose E2E suite: `./scripts/ci/docker-e2e.sh` (runs `go test -tags=e2e -v -count=1 ./e2e`)
 - Run a single test: `go test -race -run TestName ./internal/<pkg>`
-- Static analysis: `go vet ./...`
+- Static analysis: `go vet ./...` and `go vet -tags=e2e ./...`
 - Format code: `gofmt -w .`
 - Run locally via Docker Compose: `docker compose up -d --build`
 
@@ -36,8 +37,9 @@ Follow the [Google Go Style Guide](https://google.github.io/styleguide/go/) (`/g
 
 ## Testing Instructions
 
+- **Go-native tests only:** Write all test logic, fixture generation, and assertions in Go (`*_test.go`), using build tags (such as `//go:build e2e`) when external infrastructure like Docker is required. Keep shell scripts thin and restricted to container/process orchestration or CI wiring—never embed Python or other scripting languages in shell scripts or workflows for test fixtures, HTTP checks, or assertions.
 - Add or update unit and integration tests for all behavioral changes whenever possible.
-- Run `go test -race ./...` and `go vet ./...` before committing or opening a PR; fix all failures before requesting review.
+- Run `go test -race ./...`, `go vet ./...`, and `go vet -tags=e2e ./...` before committing or opening a PR; fix all failures before requesting review.
 - For HTTP/streaming changes, verify both XML (default) and JSON (`f=json`) responses as well as HTTP byte-range (`206`, `416`, `HEAD`) behavior where applicable.
 
 ## PR Instructions
