@@ -27,6 +27,6 @@ ENV PORT=4533 \
 EXPOSE 4533
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -q -T 5 -O - "http://127.0.0.1:${PORT:-4533}/rest/ping" | grep -q 'status="ok"'
+    CMD wget -q -T 5 -O - "http://127.0.0.1:${PORT:-4533}/healthz" | grep -qx 'ok'
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

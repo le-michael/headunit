@@ -21,6 +21,8 @@ const (
 	defaultAlbumListSize = 10
 	defaultSearch3Count  = 20
 	mediaTypeMusic       = "music"
+	healthzBody          = "ok\n"
+	msgUnsupportedAuth   = "Provided authentication mechanism not supported"
 )
 
 type jsonEnvelope struct {
@@ -49,6 +51,8 @@ type Response struct {
 	License *License `xml:"license,omitempty" json:"license,omitempty"`
 	// OpenSubsonicExtensions carries the getOpenSubsonicExtensions payload.
 	OpenSubsonicExtensions *[]OpenSubsonicExtension `xml:"openSubsonicExtensions,omitempty" json:"openSubsonicExtensions,omitempty"`
+	// TokenInfo carries the tokenInfo payload.
+	TokenInfo *TokenInfo `xml:"tokenInfo,omitempty" json:"tokenInfo,omitempty"`
 	// User carries the getUser payload.
 	User *User `xml:"user,omitempty" json:"user,omitempty"`
 	// ScanStatus carries the getScanStatus payload.
@@ -96,6 +100,12 @@ type OpenSubsonicExtension struct {
 	Name string `xml:"name,attr" json:"name"`
 	// Versions lists the supported specification version numbers for Name.
 	Versions []int `xml:"versions" json:"versions"`
+}
+
+// TokenInfo represents the OpenSubsonic tokenInfo payload.
+type TokenInfo struct {
+	// Username is the username associated with the authenticated API key.
+	Username string `xml:"username,attr" json:"username"`
 }
 
 // User represents the Subsonic v1.16.1 getUser payload.

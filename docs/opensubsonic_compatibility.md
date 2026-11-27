@@ -107,10 +107,10 @@ All implemented endpoints are served under both `/rest/<method>` and `/rest/<met
 
 | Endpoint | Spec Origin | Status | Target | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `ping` | Subsonic 1.16.1 | `Implemented` | `MVP` | Bare `status="ok"` envelope; also used by Docker `HEALTHCHECK`. |
+| `ping` | Subsonic 1.16.1 | `Implemented` | `MVP` | Bare `status="ok"` envelope (Docker `HEALTHCHECK` probes unauthenticated `/healthz`). |
 | `getLicense` | Subsonic 1.16.1 | `Implemented` | `MVP` | Returns `license: {valid: true}`. |
-| `getOpenSubsonicExtensions` | OpenSubsonic | `Implemented` | `MVP` | Returns empty `openSubsonicExtensions: []` (zero extension claims in MVP). Spec requires unauthenticated public access (implicitly satisfied via `NoopAuthenticator`; must bypass `auth.Middleware` when real auth is added). |
-| `tokenInfo` | OpenSubsonic (`apiKeyAuthentication`) | `Not Implemented` | `Post-MVP` | Deferred until `apiKeyAuthentication` extension is implemented. |
+| `getOpenSubsonicExtensions` | OpenSubsonic | `Implemented` | `MVP` | Returns empty `openSubsonicExtensions: []` (zero extension claims until `apiKeyAuthentication` is wired). Bypasses `auth.Middleware` directly per OpenSubsonic spec while preserving CORS and form parsing. |
+| `tokenInfo` | OpenSubsonic (`apiKeyAuthentication`) | `Partial` | `Post-MVP` | Handler and routes implemented; returns `tokenInfo.username` for `AuthMethodAPIKey` principals and error `42` otherwise. Marked `Partial` until `SubsonicAuthenticator` is wired in `cmd/headunit/main.go`. |
 
 ### 5.2 Browsing (`5 / 20`)
 
