@@ -40,7 +40,7 @@ func TestStream(t *testing.T) {
 		return !s.Scanning && s.Count == 2
 	})
 
-	searchEnv, _ := h.getJSON(t, "/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500")
+	searchEnv, _ := h.getJSON(t, h.withDefaultAuth(t, "/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500"))
 	assertJSONResponseEnvelope(t, searchEnv, "ok")
 	if searchEnv.SearchResult3 == nil {
 		t.Fatalf("search3 SearchResult3 = nil, want non-nil")
@@ -56,7 +56,7 @@ func TestStream(t *testing.T) {
 	}
 
 	t.Run("FullFLAC", func(t *testing.T) {
-		resp, body := h.doRequest(t, http.MethodGet, "/rest/stream?id="+url.QueryEscape(flacSong.ID), nil, nil)
+		resp, body := h.doRequest(t, http.MethodGet, h.withTokenAuth(t, "/rest/stream?id="+url.QueryEscape(flacSong.ID)), nil, nil)
 		if got, want := resp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("GET /rest/stream status = %d, want %d (body=%s)", got, want, string(body))
 		}
@@ -81,7 +81,7 @@ func TestStream(t *testing.T) {
 		resp, body := h.doRequest(
 			t,
 			http.MethodGet,
-			"/rest/stream?id="+url.QueryEscape(wavSong.ID),
+			h.withAPIKeyAuth(t, "/rest/stream?id="+url.QueryEscape(wavSong.ID)),
 			nil,
 			map[string]string{"Range": "bytes=0-3"},
 		)
@@ -100,7 +100,7 @@ func TestStream(t *testing.T) {
 	})
 
 	t.Run("HEAD", func(t *testing.T) {
-		resp, body := h.doRequest(t, http.MethodHead, "/rest/stream?id="+url.QueryEscape(wavSong.ID), nil, nil)
+		resp, body := h.doRequest(t, http.MethodHead, h.withTokenAuth(t, "/rest/stream?id="+url.QueryEscape(wavSong.ID)), nil, nil)
 		if got, want := resp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("HEAD /rest/stream status = %d, want %d", got, want)
 		}
@@ -122,7 +122,7 @@ func TestStream(t *testing.T) {
 		resp, body := h.doRequest(
 			t,
 			http.MethodGet,
-			"/rest/stream?id="+url.QueryEscape(wavSong.ID),
+			h.withAPIKeyAuth(t, "/rest/stream?id="+url.QueryEscape(wavSong.ID)),
 			nil,
 			map[string]string{"Range": "bytes=9999999-"},
 		)

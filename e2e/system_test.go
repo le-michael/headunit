@@ -3,11 +3,7 @@
 package e2e
 
 import (
-	"bytes"
-	"encoding/xml"
-	"net/http"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -17,21 +13,12 @@ import (
 func TestSystem(t *testing.T) {
 	h := newHarness(t)
 
+	t.Run("Healthz", func(t *testing.T) {
+		h.assertHealthz(t)
+	})
+
 	t.Run("PingXML", func(t *testing.T) {
-		resp, body := h.doRequest(t, http.MethodGet, "/rest/ping", nil, nil)
-		if got, want := resp.StatusCode, http.StatusOK; got != want {
-			t.Fatalf("GET /rest/ping status = %d, want %d (body=%s)", got, want, string(body))
-		}
-		if got, want := resp.Header.Get("Content-Type"), "application/xml; charset=utf-8"; got != want {
-			t.Errorf("GET /rest/ping Content-Type = %q, want %q", got, want)
-		}
-		if got, want := resp.Header.Get("X-Content-Type-Options"), "nosniff"; got != want {
-			t.Errorf("GET /rest/ping X-Content-Type-Options = %q, want %q", got, want)
-		}
-		if !bytes.HasPrefix(body, []byte(xml.Header)) {
-			t.Errorf("GET /rest/ping body = %q, want xml.Header prefix %q", string(body), xml.Header)
-		}
-		xmlEnv := decodeXMLResponse(t, body)
+		xmlEnv, _ := h.getXML(t, h.withTokenAuth(t, "/rest/ping"))
 		assertXMLResponseEnvelope(t, xmlEnv, "ok")
 		if xmlEnv.Error != nil {
 			t.Errorf("GET /rest/ping error = %+v, want nil", xmlEnv.Error)
@@ -39,20 +26,26 @@ func TestSystem(t *testing.T) {
 	})
 
 	t.Run("PingJSON", func(t *testing.T) {
-		jsonEnv, _ := h.getJSON(t, "/rest/ping.view?f=json")
+		jsonEnv, _ := h.getJSON(t, h.withAPIKeyAuth(t, "/rest/ping.view?f=json"))
 		assertJSONResponseEnvelope(t, jsonEnv, "ok")
 	})
 
 	t.Run("OpenSubsonicExtensions", func(t *testing.T) {
-		extEnv, extBody := h.getJSON(t, "/rest/getOpenSubsonicExtensions.view?f=json")
+		extEnv, _ := h.getJSON(t, "/rest/getOpenSubsonicExtensions.view?f=json")
 		assertJSONResponseEnvelope(t, extEnv, "ok")
-		if !strings.Contains(string(extBody), `"openSubsonicExtensions":[]`) {
-			t.Errorf("getOpenSubsonicExtensions body = %s, want empty openSubsonicExtensions array", string(extBody))
+		assertAPIKeyExtension(t, extEnv)
+	})
+
+	t.Run("TokenInfo", func(t *testing.T) {
+		tokEnv, _ := h.getJSON(t, h.withAPIKeyAuth(t, "/rest/tokenInfo?f=json"))
+		assertJSONResponseEnvelope(t, tokEnv, "ok")
+		if tokEnv.TokenInfo == nil || tokEnv.TokenInfo.Username != h.username {
+			t.Errorf("getTokenInfo = %+v, want username %q", tokEnv.TokenInfo, h.username)
 		}
 	})
 
 	t.Run("MusicFolders", func(t *testing.T) {
-		foldersEnv, _ := h.getJSON(t, "/rest/getMusicFolders?f=json")
+		foldersEnv, _ := h.getJSON(t, h.withDefaultAuth(t, "/rest/getMusicFolders?f=json"))
 		assertJSONResponseEnvelope(t, foldersEnv, "ok")
 		if foldersEnv.MusicFolders == nil {
 			t.Fatalf("getMusicFolders MusicFolders = nil, want non-nil")

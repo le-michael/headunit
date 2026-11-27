@@ -41,7 +41,7 @@ func TestLibrary(t *testing.T) {
 	})
 
 	t.Run("BrowseArtistsAndAlbums", func(t *testing.T) {
-		artistsEnv, _ := h.getJSON(t, "/rest/getArtists?f=json")
+		artistsEnv, _ := h.getJSON(t, h.withTokenAuth(t, "/rest/getArtists?f=json"))
 		assertJSONResponseEnvelope(t, artistsEnv, "ok")
 		if artistsEnv.Artists == nil {
 			t.Fatalf("getArtists Artists = nil, want non-nil")
@@ -83,7 +83,7 @@ func TestLibrary(t *testing.T) {
 			t.Fatalf("The Container Band ID = empty, want non-empty")
 		}
 
-		artistEnv, _ := h.getJSON(t, "/rest/getArtist?f=json&id="+url.QueryEscape(containerBandID))
+		artistEnv, _ := h.getJSON(t, h.withTokenAuth(t, "/rest/getArtist?f=json&id="+url.QueryEscape(containerBandID)))
 		assertJSONResponseEnvelope(t, artistEnv, "ok")
 		if artistEnv.Artist == nil {
 			t.Fatalf("getArtist Artist = nil, want non-nil")
@@ -108,7 +108,7 @@ func TestLibrary(t *testing.T) {
 			t.Fatalf("Compose Session ID = empty, want non-empty")
 		}
 
-		albumEnv, albumBody := h.getJSON(t, "/rest/getAlbum?f=json&id="+url.QueryEscape(alb.ID))
+		albumEnv, albumBody := h.getJSON(t, h.withTokenAuth(t, "/rest/getAlbum?f=json&id="+url.QueryEscape(alb.ID)))
 		assertJSONResponseEnvelope(t, albumEnv, "ok")
 		if strings.Contains(string(albumBody), `"coverArt"`) {
 			t.Errorf("getAlbum body unexpectedly contains coverArt: %s", string(albumBody))
@@ -138,7 +138,7 @@ func TestLibrary(t *testing.T) {
 	})
 
 	t.Run("Search3AndUntaggedWAVFallback", func(t *testing.T) {
-		searchEnv, _ := h.getJSON(t, "/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500")
+		searchEnv, _ := h.getJSON(t, h.withAPIKeyAuth(t, "/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500"))
 		assertJSONResponseEnvelope(t, searchEnv, "ok")
 		if searchEnv.SearchResult3 == nil {
 			t.Fatalf("search3 SearchResult3 = nil, want non-nil")

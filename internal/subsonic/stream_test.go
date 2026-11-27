@@ -146,6 +146,7 @@ func TestStreamDirectEndToEnd(t *testing.T) {
 		Auth:     auth.NoopAuthenticator{},
 		Scanner:  &atomicScanStatusProvider{},
 		Store:    st,
+		Users:    st,
 		Streamer: ds,
 	})
 	if err != nil {
@@ -388,6 +389,7 @@ func TestStreamErrorsPreHeader(t *testing.T) {
 					Auth:     auth.NoopAuthenticator{},
 					Scanner:  &atomicScanStatusProvider{},
 					Store:    tc.store,
+					Users:    &stubUserStore{},
 					Streamer: tc.streamer,
 					Logger:   logger,
 				})
@@ -471,6 +473,7 @@ func TestStreamOptionsForwardingAndAuth(t *testing.T) {
 				Auth:     auth.NoopAuthenticator{},
 				Scanner:  &atomicScanStatusProvider{},
 				Store:    spySt,
+				Users:    &stubUserStore{},
 				Streamer: spyStr,
 			})
 			if err != nil {
@@ -494,6 +497,7 @@ func TestStreamOptionsForwardingAndAuth(t *testing.T) {
 			Auth:     failingAuth,
 			Scanner:  &atomicScanStatusProvider{},
 			Store:    spySt,
+			Users:    &stubUserStore{},
 			Streamer: spyStr,
 		})
 		if err != nil {
@@ -552,6 +556,7 @@ func TestConcurrentLibraryAndStream(t *testing.T) {
 		Auth:     auth.NoopAuthenticator{},
 		Scanner:  &atomicScanStatusProvider{},
 		Store:    st,
+		Users:    st,
 		Streamer: ds,
 	})
 	if err != nil {

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -81,6 +83,9 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 	testutil.WriteBytes(t, filepath.Join(musicDir, ".DS_Store"), []byte("ignored"))
 	testutil.WriteBytes(t, filepath.Join(musicDir, "dirA", "partial.mp3.part"), []byte("partial"))
 
+	t.Setenv("DATA_DIR", dataDir)
+	t.Setenv("AUTH_SECRET_KEY", "")
+
 	cfg := config.Config{
 		Port:         "4533",
 		MusicDir:     musicDir,
@@ -154,10 +159,135 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	t.Cleanup(client.CloseIdleConnections)
 
-	var mp3TrackID, flacTrackID, wavTrackID string
+	const (
+		alicePass = "alice-super-secret-1!"
+		bobPass   = "bob-standard-secret-2@"
+	)
+	var (
+		bobKeyID    string
+		bobAPIKey   string
+		mp3TrackID  string
+		flacTrackID string
+		wavTrackID  string
+	)
+
+	aliceAuth := func(salt string) url.Values {
+		return saltedMD5Params("alice", alicePass, salt)
+	}
+	bobAuth := func(salt string) url.Values {
+		return saltedMD5Params("bob", bobPass, salt)
+	}
+	bobKeyAuth := func() url.Values {
+		return apiKeyParams(bobAPIKey)
+	}
+
+	if !t.Run("ZeroUserFailClosedAndPublicEndpoints", func(t *testing.T) {
+		// /healthz returns 200 ok\n
+		hzResp, hzBody := doHTTPRequest(t, client, http.MethodGet, baseURL+"/healthz", nil, nil)
+		if got, want := hzResp.StatusCode, http.StatusOK; got != want {
+			t.Fatalf("GET /healthz status = %d, want %d", got, want)
+		}
+		if got, want := string(hzBody), "ok\n"; got != want {
+			t.Errorf("GET /healthz body = %q, want %q", got, want)
+		}
+
+		// Zero-user /rest/ping fails closed with Subsonic error 40 (XML & JSON).
+		pingXMLResp, pingXMLBody := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/ping", nil, nil)
+		if got, want := pingXMLResp.StatusCode, http.StatusOK; got != want {
+			t.Fatalf("GET /rest/ping status = %d, want %d", got, want)
+		}
+		pingXMLEnv := decodeXMLResponse(t, pingXMLBody)
+		assertXMLResponseEnvelope(t, pingXMLEnv, "failed")
+		if pingXMLEnv.Error == nil || pingXMLEnv.Error.Code != 40 {
+			t.Errorf("GET /rest/ping XML error = %+v, want code 40", pingXMLEnv.Error)
+		}
+
+		pingJSONEnv, _ := getJSONResponse(t, client, baseURL+"/rest/ping?f=json")
+		assertJSONResponseEnvelope(t, pingJSONEnv, "failed")
+		if pingJSONEnv.Error == nil || pingJSONEnv.Error.Code != 40 {
+			t.Errorf("GET /rest/ping JSON error = %+v, want code 40", pingJSONEnv.Error)
+		}
+
+		// Unauthenticated /rest/getOpenSubsonicExtensions advertises apiKeyAuthentication v1 (XML & JSON).
+		extXMLResp, extXMLBody := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/getOpenSubsonicExtensions", nil, nil)
+		if got, want := extXMLResp.StatusCode, http.StatusOK; got != want {
+			t.Fatalf("GET /rest/getOpenSubsonicExtensions XML status = %d, want %d", got, want)
+		}
+		extXMLEnv := decodeXMLResponse(t, extXMLBody)
+		assertXMLResponseEnvelope(t, extXMLEnv, "ok")
+		assertAPIKeyExtensionV1(t, extXMLEnv)
+
+		extJSONEnv, extJSONRaw := getJSONResponse(t, client, baseURL+"/rest/getOpenSubsonicExtensions.view?f=json")
+		assertJSONResponseEnvelope(t, extJSONEnv, "ok")
+		assertAPIKeyExtensionV1(t, extJSONEnv)
+		if !strings.Contains(string(extJSONRaw), `"openSubsonicExtensions":[{"name":"apiKeyAuthentication","versions":[1]}]`) {
+			t.Errorf("getOpenSubsonicExtensions raw JSON = %s, want apiKeyAuthentication v1", string(extJSONRaw))
+		}
+
+		// Verify <dataDir>/auth.key exists as a regular file with mode 0600.
+		keyPath := filepath.Join(dataDir, "auth.key")
+		info, err := os.Lstat(keyPath)
+		if err != nil {
+			t.Fatalf("os.Lstat(%q) unexpected error: %v", keyPath, err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Errorf("%q mode = %v, want regular file", keyPath, info.Mode())
+		}
+		if got, want := info.Mode().Perm(), os.FileMode(0o600); got != want {
+			t.Errorf("%q perm = %o, want %o", keyPath, got, want)
+		}
+	}) {
+		return
+	}
+
+	if !t.Run("LiveCLIProvisioning", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if err := runCLI(
+			context.Background(),
+			[]string{"user", "create", "--username", "alice", "--admin", "--password-stdin"},
+			strings.NewReader(alicePass+"\n"),
+			&stdout,
+			&stderr,
+		); err != nil {
+			t.Fatalf("runCLI(user create alice) unexpected error: %v (stderr=%s)", err, stderr.String())
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		t.Setenv("HEADUNIT_TEST_BOB_PW", bobPass)
+		if err := runCLI(
+			context.Background(),
+			[]string{"user", "create", "--username", "bob", "--password-env", "HEADUNIT_TEST_BOB_PW"},
+			nil,
+			&stdout,
+			&stderr,
+		); err != nil {
+			t.Fatalf("runCLI(user create bob) unexpected error: %v (stderr=%s)", err, stderr.String())
+		}
+
+		stdout.Reset()
+		stderr.Reset()
+		if err := runCLI(
+			context.Background(),
+			[]string{"apikey", "create", "--username", "bob", "--name", "main-e2e-key"},
+			nil,
+			&stdout,
+			&stderr,
+		); err != nil {
+			t.Fatalf("runCLI(apikey create bob) unexpected error: %v (stderr=%s)", err, stderr.String())
+		}
+		createdKey := parseAPIKeyCreateOutput(t, stdout.String())
+		bobKeyID = createdKey["id"]
+		bobAPIKey = createdKey["api_key"]
+		if bobKeyID == "" || !strings.HasPrefix(bobAPIKey, "hu_") {
+			t.Fatalf("created key = %+v, want non-empty id and hu_ api_key", createdKey)
+		}
+	}) {
+		return
+	}
 
 	if !t.Run("StartupScanStatus", func(t *testing.T) {
-		status := pollScanStatus(t, client, baseURL, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
+		status := pollScanStatus(t, client, baseURL, aliceAuth, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
 			return !s.Scanning && s.Count == 3 && s.LastScan != ""
 		})
 		if _, err := time.Parse(time.RFC3339, status.LastScan); err != nil {
@@ -168,8 +298,8 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 	}
 
 	t.Run("SystemDualRoutesAndMethods", func(t *testing.T) {
-		// GET /rest/ping (default XML)
-		resp, body := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/ping", nil, nil)
+		// GET /rest/ping (default XML, salted MD5)
+		resp, body := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/ping", aliceAuth("ping-xml-1")), nil, nil)
 		if got, want := resp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("GET /rest/ping status = %d, want %d", got, want)
 		}
@@ -188,12 +318,12 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			t.Errorf("GET /rest/ping error = %+v, want nil", xmlEnv.Error)
 		}
 
-		// GET /rest/ping.view?f=json
-		jsonEnv, _ := getJSONResponse(t, client, baseURL+"/rest/ping.view?f=json")
+		// GET /rest/ping.view?f=json (apiKey)
+		jsonEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/ping.view?f=json", bobKeyAuth()))
 		assertJSONResponseEnvelope(t, jsonEnv, "ok")
 
 		// HEAD /rest/ping
-		headResp, headBody := doHTTPRequest(t, client, http.MethodHead, baseURL+"/rest/ping", nil, nil)
+		headResp, headBody := doHTTPRequest(t, client, http.MethodHead, withQueryParams(baseURL+"/rest/ping", aliceAuth("ping-head-1")), nil, nil)
 		if got, want := headResp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("HEAD /rest/ping status = %d, want %d", got, want)
 		}
@@ -226,8 +356,9 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			t.Errorf("CORS Expose-Headers = %q, want to include Content-Range", got)
 		}
 
-		// POST /rest/getUser.view with form body f=json&u=alice
-		formValues := url.Values{"f": {"json"}, "u": {"alice"}}
+		// POST /rest/getUser.view with form body f=json and salted MD5 credentials for alice
+		formValues := aliceAuth("post-user-1")
+		formValues.Set("f", "json")
 		postHeaders := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
 		userResp, userBody := doHTTPRequest(t, client, http.MethodPost, baseURL+"/rest/getUser.view", strings.NewReader(formValues.Encode()), postHeaders)
 		if got, want := userResp.StatusCode, http.StatusOK; got != want {
@@ -241,6 +372,9 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		if got, want := userEnv.User.Username, "alice"; got != want {
 			t.Errorf("user.username = %q, want %q", got, want)
 		}
+		if !userEnv.User.AdminRole {
+			t.Errorf("user.adminRole = false, want true")
+		}
 		if !userEnv.User.StreamRole {
 			t.Errorf("user.streamRole = false, want true")
 		}
@@ -252,23 +386,114 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		}
 
 		// GET /rest/getLicense?f=json
-		licEnv, _ := getJSONResponse(t, client, baseURL+"/rest/getLicense?f=json")
+		licEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getLicense?f=json", bobKeyAuth()))
 		assertJSONResponseEnvelope(t, licEnv, "ok")
 		if licEnv.License == nil || !licEnv.License.Valid {
 			t.Errorf("getLicense license = %+v, want valid=true", licEnv.License)
 		}
+	})
 
-		// GET /rest/getOpenSubsonicExtensions.view?f=json
-		extEnv, extRaw := getJSONResponse(t, client, baseURL+"/rest/getOpenSubsonicExtensions.view?f=json")
-		assertJSONResponseEnvelope(t, extEnv, "ok")
-		if !strings.Contains(string(extRaw), `"openSubsonicExtensions":[]`) {
-			t.Errorf("getOpenSubsonicExtensions raw JSON = %s, want substring %q", string(extRaw), `"openSubsonicExtensions":[]`)
+	t.Run("TokenInfoAndGetUserRoles", func(t *testing.T) {
+		// tokenInfo with apiKey succeeds and returns owning username.
+		tokEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/tokenInfo?f=json", bobKeyAuth()))
+		assertJSONResponseEnvelope(t, tokEnv, "ok")
+		if tokEnv.TokenInfo == nil || tokEnv.TokenInfo.Username != "bob" {
+			t.Errorf("tokenInfo = %+v, want username=bob", tokEnv.TokenInfo)
+		}
+
+		// tokenInfo with salted MD5 token returns Subsonic error 42.
+		tokFailEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/tokenInfo?f=json", aliceAuth("tok-fail-1")))
+		assertJSONResponseEnvelope(t, tokFailEnv, "failed")
+		if tokFailEnv.Error == nil || tokFailEnv.Error.Code != 42 {
+			t.Errorf("tokenInfo(token auth) error = %+v, want code 42", tokFailEnv.Error)
+		}
+
+		// Standard user bob: self (omitted & case-insensitive) succeeds with adminRole=false;
+		// querying another existing or unknown user returns 50.
+		bobSelfEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getUser?f=json", bobKeyAuth()))
+		assertJSONResponseEnvelope(t, bobSelfEnv, "ok")
+		if bobSelfEnv.User == nil || bobSelfEnv.User.Username != "bob" || bobSelfEnv.User.AdminRole || !bobSelfEnv.User.StreamRole {
+			t.Errorf("bob getUser(self) = %+v, want username=bob adminRole=false streamRole=true", bobSelfEnv.User)
+		}
+
+		bobCaseParams := bobAuth("bob-case-1")
+		bobCaseParams.Set("username", "BOB")
+		bobCaseEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getUser?f=json", bobCaseParams))
+		assertJSONResponseEnvelope(t, bobCaseEnv, "ok")
+		if bobCaseEnv.User == nil || bobCaseEnv.User.Username != "bob" || bobCaseEnv.User.AdminRole {
+			t.Errorf("bob getUser(BOB) = %+v, want canonical username=bob adminRole=false", bobCaseEnv.User)
+		}
+
+		for _, target := range []string{"alice", "ghost"} {
+			params := bobAuth("bob-other-" + target)
+			params.Set("username", target)
+			env, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getUser?f=json", params))
+			assertJSONResponseEnvelope(t, env, "failed")
+			if env.Error == nil || env.Error.Code != 50 {
+				t.Errorf("non-admin bob getUser(%q) error = %+v, want code 50", target, env.Error)
+			}
+		}
+
+		// Admin alice: querying bob succeeds; querying unknown user returns 70.
+		aliceBobParams := aliceAuth("alice-get-bob")
+		aliceBobParams.Set("username", "bob")
+		aliceBobEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getUser?f=json", aliceBobParams))
+		assertJSONResponseEnvelope(t, aliceBobEnv, "ok")
+		if aliceBobEnv.User == nil || aliceBobEnv.User.Username != "bob" || aliceBobEnv.User.AdminRole {
+			t.Errorf("admin getUser(bob) = %+v, want username=bob adminRole=false", aliceBobEnv.User)
+		}
+
+		aliceGhostParams := aliceAuth("alice-get-ghost")
+		aliceGhostParams.Set("username", "ghost")
+		aliceGhostEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getUser?f=json", aliceGhostParams))
+		assertJSONResponseEnvelope(t, aliceGhostEnv, "failed")
+		if aliceGhostEnv.Error == nil || aliceGhostEnv.Error.Code != 70 {
+			t.Errorf("admin getUser(ghost) error = %+v, want code 70", aliceGhostEnv.Error)
+		}
+	})
+
+	t.Run("NegativeAuthMatrix", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			params   url.Values
+			wantCode int
+		}{
+			{
+				name:     "deprecated plaintext password",
+				params:   url.Values{"u": {"alice"}, "p": {"secret"}},
+				wantCode: 42,
+			},
+			{
+				name:     "conflicting apiKey and u",
+				params:   url.Values{"apiKey": {bobAPIKey}, "u": {"alice"}},
+				wantCode: 43,
+			},
+			{
+				name:     "invalid apiKey",
+				params:   url.Values{"apiKey": {"hu_0000000000000000000000000000000000000000000000000000000000000000"}},
+				wantCode: 44,
+			},
+			{
+				name:     "wrong password token",
+				params:   saltedMD5Params("alice", "wrong-password", "bad-salt-1"),
+				wantCode: 40,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				env, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/ping?f=json", tc.params))
+				assertJSONResponseEnvelope(t, env, "failed")
+				if env.Error == nil || env.Error.Code != tc.wantCode {
+					t.Errorf("%s: error = %+v, want code %d", tc.name, env.Error, tc.wantCode)
+				}
+			})
 		}
 	})
 
 	if !t.Run("LibraryBrowseAndSearch3", func(t *testing.T) {
-		// getMusicFolders
-		foldersEnv, _ := getJSONResponse(t, client, baseURL+"/rest/getMusicFolders?f=json")
+		// getMusicFolders (salted MD5)
+		foldersEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getMusicFolders?f=json", aliceAuth("browse-1")))
 		assertJSONResponseEnvelope(t, foldersEnv, "ok")
 		if foldersEnv.MusicFolders == nil {
 			t.Fatalf("getMusicFolders missing musicFolders payload")
@@ -279,7 +504,7 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		}
 
 		// getArtists: verifies ignoredArticles ("The Alpha Band" -> "A") and fallback ("Unknown Artist" -> "U").
-		artistsEnv, _ := getJSONResponse(t, client, baseURL+"/rest/getArtists?f=json")
+		artistsEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getArtists?f=json", aliceAuth("browse-2")))
 		assertJSONResponseEnvelope(t, artistsEnv, "ok")
 		if artistsEnv.Artists == nil {
 			t.Fatalf("getArtists missing artists payload")
@@ -300,8 +525,8 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		}
 		alphaArtistID := idxA.Artist[0].ID
 
-		// getArtist
-		artistEnv, _ := getJSONResponse(t, client, baseURL+"/rest/getArtist?f=json&id="+url.QueryEscape(alphaArtistID))
+		// getArtist (apiKey)
+		artistEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getArtist?f=json&id="+url.QueryEscape(alphaArtistID), bobKeyAuth()))
 		assertJSONResponseEnvelope(t, artistEnv, "ok")
 		if artistEnv.Artist == nil {
 			t.Fatalf("getArtist missing artist payload")
@@ -318,7 +543,7 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		}
 
 		// getAlbum: 2 tracks ordered by track number across separate folders, zero coverArt key.
-		albumEnv, albumRaw := getJSONResponse(t, client, baseURL+"/rest/getAlbum?f=json&id="+url.QueryEscape(firstLight.ID))
+		albumEnv, albumRaw := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getAlbum?f=json&id="+url.QueryEscape(firstLight.ID), aliceAuth("browse-3")))
 		assertJSONResponseEnvelope(t, albumEnv, "ok")
 		if strings.Contains(string(albumRaw), `"coverArt"`) {
 			t.Errorf("getAlbum raw JSON unexpectedly contains coverArt key: %s", string(albumRaw))
@@ -336,8 +561,8 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		mp3TrackID = s0.ID
 		flacTrackID = s1.ID
 
-		// getAlbumList2?type=alphabeticalByName
-		albumListEnv, _ := getJSONResponse(t, client, baseURL+"/rest/getAlbumList2?f=json&type=alphabeticalByName")
+		// getAlbumList2?type=alphabeticalByName (apiKey)
+		albumListEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getAlbumList2?f=json&type=alphabeticalByName", bobKeyAuth()))
 		assertJSONResponseEnvelope(t, albumListEnv, "ok")
 		if albumListEnv.AlbumList2 == nil || len(albumListEnv.AlbumList2.Album) != 2 {
 			t.Fatalf("getAlbumList2 albums = %+v, want 2 albums", albumListEnv.AlbumList2)
@@ -349,14 +574,14 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		}
 
 		// getSong (JSON)
-		songJSONEnv, _ := getJSONResponse(t, client, baseURL+"/rest/getSong?f=json&id="+url.QueryEscape(mp3TrackID))
+		songJSONEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getSong?f=json&id="+url.QueryEscape(mp3TrackID), bobKeyAuth()))
 		assertJSONResponseEnvelope(t, songJSONEnv, "ok")
 		if songJSONEnv.Song == nil || songJSONEnv.Song.ID != mp3TrackID || songJSONEnv.Song.Title != "Opening" {
 			t.Errorf("getSong JSON song = %+v, want id=%q title='Opening'", songJSONEnv.Song, mp3TrackID)
 		}
 
 		// getSong (XML)
-		songXMLResp, songXMLBody := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/getSong?id="+url.QueryEscape(mp3TrackID), nil, nil)
+		songXMLResp, songXMLBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/getSong?id="+url.QueryEscape(mp3TrackID), aliceAuth("browse-4")), nil, nil)
 		if got, want := songXMLResp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("GET /rest/getSong XML status = %d, want %d", got, want)
 		}
@@ -366,8 +591,8 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			t.Errorf("getSong XML song = %+v, want id=%q title='Opening' contentType='audio/mpeg'", songXMLEnv.Song, mp3TrackID)
 		}
 
-		// search3 bulk sync (literal "")
-		searchEnv, _ := getJSONResponse(t, client, baseURL+"/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500")
+		// search3 bulk sync (literal "", apiKey)
+		searchEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500", bobKeyAuth()))
 		assertJSONResponseEnvelope(t, searchEnv, "ok")
 		if searchEnv.SearchResult3 == nil {
 			t.Fatalf("search3 missing searchResult3 payload")
@@ -402,8 +627,8 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 	}
 
 	t.Run("DirectRangeStreaming", func(t *testing.T) {
-		// 200 full stream MP3
-		mp3Resp, mp3Body := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/stream?id="+url.QueryEscape(mp3TrackID), nil, nil)
+		// 200 full stream MP3 (salted MD5)
+		mp3Resp, mp3Body := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(mp3TrackID), aliceAuth("stream-1")), nil, nil)
 		if got, want := mp3Resp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("GET /rest/stream MP3 status = %d, want %d", got, want)
 		}
@@ -423,9 +648,9 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			t.Errorf("MP3 stream body mismatch: got %d bytes, want %d bytes", len(mp3Body), len(mp3Bytes))
 		}
 
-		// 206 partial content FLAC bytes=0-1 -> "fL"
+		// 206 partial content FLAC bytes=0-1 -> "fL" (apiKey)
 		rangeHeaders := map[string]string{"Range": "bytes=0-1"}
-		flacResp, flacBody := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/stream?id="+url.QueryEscape(flacTrackID), nil, rangeHeaders)
+		flacResp, flacBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(flacTrackID), bobKeyAuth()), nil, rangeHeaders)
 		if got, want := flacResp.StatusCode, http.StatusPartialContent; got != want {
 			t.Fatalf("GET /rest/stream FLAC range status = %d, want %d", got, want)
 		}
@@ -440,9 +665,9 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			t.Errorf("FLAC range body = %q, want %q", got, want)
 		}
 
-		// 416 unsatisfiable range WAV
+		// 416 unsatisfiable range WAV (apiKey)
 		badRangeHeaders := map[string]string{"Range": "bytes=9999999-"}
-		wav416Resp, _ := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/stream?id="+url.QueryEscape(wavTrackID), nil, badRangeHeaders)
+		wav416Resp, _ := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(wavTrackID), bobKeyAuth()), nil, badRangeHeaders)
 		if got, want := wav416Resp.StatusCode, http.StatusRequestedRangeNotSatisfiable; got != want {
 			t.Errorf("GET /rest/stream WAV invalid range status = %d, want %d", got, want)
 		}
@@ -451,8 +676,8 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			t.Errorf("WAV 416 Content-Range = %q, want %q", got, want416Range)
 		}
 
-		// HEAD /rest/stream WAV
-		wavHeadResp, wavHeadBody := doHTTPRequest(t, client, http.MethodHead, baseURL+"/rest/stream?id="+url.QueryEscape(wavTrackID), nil, nil)
+		// HEAD /rest/stream WAV (salted MD5)
+		wavHeadResp, wavHeadBody := doHTTPRequest(t, client, http.MethodHead, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(wavTrackID), aliceAuth("stream-head")), nil, nil)
 		if got, want := wavHeadResp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("HEAD /rest/stream WAV status = %d, want %d", got, want)
 		}
@@ -470,7 +695,7 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		}
 
 		// Unknown track ID -> HTTP 200 Subsonic error 70 with zero audio headers
-		errResp, errBody := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/stream?id=tr_unknown&f=json", nil, nil)
+		errResp, errBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id=tr_unknown&f=json", bobKeyAuth()), nil, nil)
 		if got, want := errResp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("GET /rest/stream unknown id status = %d, want %d", got, want)
 		}
@@ -490,19 +715,19 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 	})
 
 	t.Run("CompatibilityStubs", func(t *testing.T) {
-		plEnv, plRaw := getJSONResponse(t, client, baseURL+"/rest/getPlaylists?f=json")
+		plEnv, plRaw := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getPlaylists?f=json", aliceAuth("stub-1")))
 		assertJSONResponseEnvelope(t, plEnv, "ok")
 		if !strings.Contains(string(plRaw), `"playlist":[]`) {
 			t.Errorf("getPlaylists raw JSON = %s, want non-null empty array", string(plRaw))
 		}
 
-		genreEnv, genreRaw := getJSONResponse(t, client, baseURL+"/rest/getGenres?f=json")
+		genreEnv, genreRaw := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getGenres?f=json", bobKeyAuth()))
 		assertJSONResponseEnvelope(t, genreEnv, "ok")
 		if !strings.Contains(string(genreRaw), `"genre":[]`) {
 			t.Errorf("getGenres raw JSON = %s, want non-null empty array", string(genreRaw))
 		}
 
-		starEnv, starRaw := getJSONResponse(t, client, baseURL+"/rest/getStarred2?f=json")
+		starEnv, starRaw := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getStarred2?f=json", aliceAuth("stub-2")))
 		assertJSONResponseEnvelope(t, starEnv, "ok")
 		for _, wantKey := range []string{`"artist":[]`, `"album":[]`, `"song":[]`} {
 			if !strings.Contains(string(starRaw), wantKey) {
@@ -510,13 +735,13 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			}
 		}
 
-		coverEnv, _ := getJSONResponse(t, client, baseURL+"/rest/getCoverArt?f=json&id=al_missing")
+		coverEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getCoverArt?f=json&id=al_missing", bobKeyAuth()))
 		assertJSONResponseEnvelope(t, coverEnv, "failed")
 		if coverEnv.Error == nil || coverEnv.Error.Code != 70 {
 			t.Errorf("getCoverArt error = %+v, want code 70", coverEnv.Error)
 		}
 
-		scrobbleEnv, _ := getJSONResponse(t, client, baseURL+"/rest/scrobble?f=json&id="+url.QueryEscape(mp3TrackID))
+		scrobbleEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/scrobble?f=json&id="+url.QueryEscape(mp3TrackID), aliceAuth("stub-3")))
 		assertJSONResponseEnvelope(t, scrobbleEnv, "ok")
 	})
 
@@ -537,11 +762,11 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 		livePath := filepath.Join(musicDir, "live-added", "nested", "01 - Live Drop.flac")
 		testutil.WriteBytes(t, livePath, liveBytes)
 
-		pollScanStatus(t, client, baseURL, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
+		pollScanStatus(t, client, baseURL, aliceAuth, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
 			return !s.Scanning && s.Count == 4
 		})
 
-		searchEnv, _ := getJSONResponse(t, client, baseURL+"/rest/search3?f=json&query=Live+Drop")
+		searchEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/search3?f=json&query=Live+Drop", bobKeyAuth()))
 		assertJSONResponseEnvelope(t, searchEnv, "ok")
 		if searchEnv.SearchResult3 == nil {
 			t.Fatalf("search3 Live Drop missing searchResult3 payload")
@@ -554,7 +779,7 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			t.Errorf("liveSong.Title = %q, want %q", got, want)
 		}
 
-		streamResp, streamBody := doHTTPRequest(t, client, http.MethodGet, baseURL+"/rest/stream?id="+url.QueryEscape(liveSong.ID), nil, nil)
+		streamResp, streamBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(liveSong.ID), bobKeyAuth()), nil, nil)
 		if got, want := streamResp.StatusCode, http.StatusOK; got != want {
 			t.Fatalf("GET /rest/stream live track status = %d, want %d", got, want)
 		}
@@ -566,15 +791,60 @@ func TestFullStackLifecycleAndOpenSubsonicE2E(t *testing.T) {
 			t.Fatalf("os.Remove(%q) unexpected error: %v", livePath, err)
 		}
 
-		pollScanStatus(t, client, baseURL, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
+		pollScanStatus(t, client, baseURL, aliceAuth, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
 			return !s.Scanning && s.Count == 3
 		})
 
-		deletedEnv, _ := getJSONResponse(t, client, baseURL+"/rest/stream?id="+url.QueryEscape(liveSong.ID)+"&f=json")
+		deletedEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(liveSong.ID)+"&f=json", aliceAuth("watch-del")))
 		assertJSONResponseEnvelope(t, deletedEnv, "failed")
 		if deletedEnv.Error == nil || deletedEnv.Error.Code != 70 {
 			t.Errorf("stream deleted track error = %+v, want code 70", deletedEnv.Error)
 		}
+	})
+
+	t.Run("LiveRevocationAndDisable", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if err := runCLI(
+			context.Background(),
+			[]string{"apikey", "revoke", "--id", bobKeyID},
+			nil,
+			&stdout,
+			&stderr,
+		); err != nil {
+			t.Fatalf("runCLI(apikey revoke) unexpected error: %v (stderr=%s)", err, stderr.String())
+		}
+
+		revokedEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/ping?f=json", bobKeyAuth()))
+		assertJSONResponseEnvelope(t, revokedEnv, "failed")
+		if revokedEnv.Error == nil || revokedEnv.Error.Code != 44 {
+			t.Errorf("ping after apikey revoke error = %+v, want code 44", revokedEnv.Error)
+		}
+
+		// Bob's token auth remains active until bob is disabled.
+		bobStillOK, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/ping?f=json", bobAuth("bob-before-disable")))
+		assertJSONResponseEnvelope(t, bobStillOK, "ok")
+
+		stdout.Reset()
+		stderr.Reset()
+		if err := runCLI(
+			context.Background(),
+			[]string{"user", "disable", "--username", "bob"},
+			nil,
+			&stdout,
+			&stderr,
+		); err != nil {
+			t.Fatalf("runCLI(user disable bob) unexpected error: %v (stderr=%s)", err, stderr.String())
+		}
+
+		disabledEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/ping?f=json", bobAuth("bob-after-disable")))
+		assertJSONResponseEnvelope(t, disabledEnv, "failed")
+		if disabledEnv.Error == nil || disabledEnv.Error.Code != 40 {
+			t.Errorf("ping after user disable error = %+v, want code 40", disabledEnv.Error)
+		}
+
+		// Admin alice remains authenticated.
+		aliceStillOK, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/ping?f=json", aliceAuth("alice-still-ok")))
+		assertJSONResponseEnvelope(t, aliceStillOK, "ok")
 	})
 
 	t.Run("GracefulShutdownAndWALReopen", func(t *testing.T) {
@@ -656,14 +926,100 @@ func TestStartupAndServeFailureCleanup(t *testing.T) {
 		}
 	})
 
+	t.Run("corrupt auth key", func(t *testing.T) {
+		dataDir := t.TempDir()
+		secretMaterial := "not-valid-hex-secret-material"
+		keyPath := filepath.Join(dataDir, "auth.key")
+		if err := os.WriteFile(keyPath, []byte(secretMaterial+"\n"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(%q) unexpected error: %v", keyPath, err)
+		}
+
+		cfg := config.Config{
+			Port:         "4533",
+			MusicDir:     t.TempDir(),
+			DataDir:      dataDir,
+			ScanInterval: 0,
+		}
+
+		srv, err := newServer(context.Background(), cfg, nil)
+		if err == nil {
+			_ = srv.closeResources()
+			t.Fatalf("newServer() error = nil, want error for corrupt auth.key")
+		}
+		if srv != nil {
+			t.Fatalf("newServer() server = %+v, want nil", srv)
+		}
+		if strings.Contains(err.Error(), secretMaterial) {
+			t.Errorf("newServer() error leaked key file contents: %v", err)
+		}
+
+		assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 0)
+	})
+
+	t.Run("symlink auth key", func(t *testing.T) {
+		dataDir := t.TempDir()
+		target := filepath.Join(t.TempDir(), "real.key")
+		testutil.WriteBytes(t, target, []byte(strings.Repeat("ab", 32)+"\n"))
+		keyPath := filepath.Join(dataDir, "auth.key")
+		if err := os.Symlink(target, keyPath); err != nil {
+			t.Fatalf("os.Symlink() unexpected error: %v", err)
+		}
+
+		cfg := config.Config{
+			Port:         "4533",
+			MusicDir:     t.TempDir(),
+			DataDir:      dataDir,
+			ScanInterval: 0,
+		}
+
+		srv, err := newServer(context.Background(), cfg, nil)
+		if err == nil {
+			_ = srv.closeResources()
+			t.Fatalf("newServer() error = nil, want error for symlink auth.key")
+		}
+		if srv != nil {
+			t.Fatalf("newServer() server = %+v, want nil", srv)
+		}
+
+		assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 0)
+	})
+
+	t.Run("invalid AUTH_SECRET_KEY", func(t *testing.T) {
+		dataDir := t.TempDir()
+		secretMaterial := "deadbeef-invalid-secret-material"
+		cfg := config.Config{
+			Port:          "4533",
+			MusicDir:      t.TempDir(),
+			DataDir:       dataDir,
+			ScanInterval:  0,
+			AuthSecretKey: secretMaterial,
+		}
+
+		srv, err := newServer(context.Background(), cfg, nil)
+		if err == nil {
+			_ = srv.closeResources()
+			t.Fatalf("newServer() error = nil, want error for invalid AUTH_SECRET_KEY")
+		}
+		if srv != nil {
+			t.Fatalf("newServer() server = %+v, want nil", srv)
+		}
+		if strings.Contains(err.Error(), secretMaterial) {
+			t.Errorf("newServer() error leaked AUTH_SECRET_KEY contents: %v", err)
+		}
+
+		assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 0)
+	})
+
 	t.Run("invalid env config", func(t *testing.T) {
 		tests := []struct {
-			name         string
-			port         string
-			scanInterval string
+			name          string
+			port          string
+			scanInterval  string
+			authSecretKey string
 		}{
 			{name: "PORT=0", port: "0", scanInterval: "0"},
 			{name: "SCAN_INTERVAL=-1s", port: "4533", scanInterval: "-1s"},
+			{name: "AUTH_SECRET_KEY=invalid", port: "4533", scanInterval: "0", authSecretKey: "bad-secret-value"},
 		}
 
 		for _, tc := range tests {
@@ -672,9 +1028,14 @@ func TestStartupAndServeFailureCleanup(t *testing.T) {
 				t.Setenv("MUSIC_DIR", t.TempDir())
 				t.Setenv("DATA_DIR", t.TempDir())
 				t.Setenv("SCAN_INTERVAL", tc.scanInterval)
+				t.Setenv("AUTH_SECRET_KEY", tc.authSecretKey)
 
-				if err := run(context.Background(), nil); err == nil {
+				err := run(context.Background(), nil)
+				if err == nil {
 					t.Fatalf("run() error = nil, want validation error for %s", tc.name)
+				}
+				if tc.authSecretKey != "" && strings.Contains(err.Error(), tc.authSecretKey) {
+					t.Errorf("run() error leaked AUTH_SECRET_KEY: %v", err)
 				}
 			})
 		}
@@ -697,6 +1058,7 @@ func TestStartupAndServeFailureCleanup(t *testing.T) {
 		t.Setenv("MUSIC_DIR", t.TempDir())
 		t.Setenv("DATA_DIR", dataDir)
 		t.Setenv("SCAN_INTERVAL", "0")
+		t.Setenv("AUTH_SECRET_KEY", "")
 
 		err = run(context.Background(), slog.New(slog.DiscardHandler))
 		if err == nil {
@@ -997,10 +1359,53 @@ func assertCommonEnvelope(t *testing.T, env subsonic.Response, wantStatus string
 	}
 }
 
+func saltedMD5Params(username, password, salt string) url.Values {
+	sum := md5.Sum([]byte(password + salt))
+	return url.Values{
+		"u": {username},
+		"t": {hex.EncodeToString(sum[:])},
+		"s": {salt},
+	}
+}
+
+func apiKeyParams(rawKey string) url.Values {
+	return url.Values{"apiKey": {rawKey}}
+}
+
+func withQueryParams(rawURL string, params url.Values) string {
+	if len(params) == 0 {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	for k, vals := range params {
+		for _, v := range vals {
+			q.Add(k, v)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func assertAPIKeyExtensionV1(t *testing.T, env subsonic.Response) {
+	t.Helper()
+	if env.OpenSubsonicExtensions == nil {
+		t.Fatalf("openSubsonicExtensions = nil, want apiKeyAuthentication v1")
+	}
+	exts := *env.OpenSubsonicExtensions
+	if len(exts) != 1 || exts[0].Name != "apiKeyAuthentication" || !slices.Equal(exts[0].Versions, []int{1}) {
+		t.Errorf("openSubsonicExtensions = %+v, want [{Name:apiKeyAuthentication Versions:[1]}]", exts)
+	}
+}
+
 func pollScanStatus(
 	t *testing.T,
 	client *http.Client,
 	baseURL string,
+	authFn func(salt string) url.Values,
 	timeout time.Duration,
 	ready func(subsonic.ScanStatus) bool,
 ) subsonic.ScanStatus {
@@ -1011,8 +1416,9 @@ func pollScanStatus(
 	defer ticker.Stop()
 
 	var last subsonic.ScanStatus
-	for {
-		env, _ := getJSONResponse(t, client, baseURL+"/rest/getScanStatus?f=json")
+	for i := 0; ; i++ {
+		rawURL := withQueryParams(baseURL+"/rest/getScanStatus?f=json", authFn(fmt.Sprintf("poll-salt-%d", i)))
+		env, _ := getJSONResponse(t, client, rawURL)
 		assertJSONResponseEnvelope(t, env, "ok")
 		if env.ScanStatus != nil {
 			last = *env.ScanStatus

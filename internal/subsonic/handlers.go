@@ -1,6 +1,7 @@
 package subsonic
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"headunit/internal/auth"
+	"headunit/internal/store"
 )
 
 func (h *handler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -33,7 +35,12 @@ func (h *handler) handleGetLicense(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) handleGetOpenSubsonicExtensions(w http.ResponseWriter, r *http.Request) {
-	exts := []OpenSubsonicExtension{}
+	exts := []OpenSubsonicExtension{
+		{
+			Name:     extAPIKeyAuth,
+			Versions: []int{1},
+		},
+	}
 	h.writeOK(w, r, Response{
 		OpenSubsonicExtensions: &exts,
 	})
@@ -53,19 +60,43 @@ func (h *handler) handleTokenInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) handleGetUser(w http.ResponseWriter, r *http.Request) {
-	username := strings.TrimSpace(formParam(r, "username"))
-	if username == "" {
-		username = strings.TrimSpace(auth.PrincipalFromContext(r.Context()).Username)
+	principal := auth.PrincipalFromContext(r.Context())
+	principalUsername := strings.TrimSpace(principal.Username)
+
+	target := strings.TrimSpace(formParam(r, "username"))
+	if target == "" {
+		target = principalUsername
 	}
-	if username == "" {
-		username = defaultUsername
+	if target == "" {
+		h.writeError(w, r, errCodeNotAuthorized, msgNotAuthorized)
+		return
+	}
+	// Enforce self-or-admin authorization before touching the database to prevent username enumeration.
+	if !principal.IsAdmin && !strings.EqualFold(target, principalUsername) {
+		h.writeError(w, r, errCodeNotAuthorized, msgNotAuthorized)
+		return
+	}
+
+	user, err := h.users.GetUserByUsername(r.Context(), target)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			h.writeError(w, r, errCodeNotFound, "User not found")
+			return
+		}
+		h.writeInternalError(w, r, "get user", err)
+		return
+	}
+	if user == nil {
+		h.writeError(w, r, errCodeNotFound, "User not found")
+		return
 	}
 
 	h.writeOK(w, r, Response{
 		User: &User{
-			Username:   username,
+			Username:   user.Username,
+			AdminRole:  user.IsAdmin,
 			StreamRole: true,
-			Folder:     []int{1},
+			Folder:     []int{musicFolderID},
 		},
 	})
 }

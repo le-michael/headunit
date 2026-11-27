@@ -49,6 +49,7 @@ func newLibraryHandler(t *testing.T, st subsonic.LibraryStore, logger *slog.Logg
 		Auth:     auth.NoopAuthenticator{},
 		Scanner:  &atomicScanStatusProvider{},
 		Store:    st,
+		Users:    &stubUserStore{},
 		Streamer: noopStreamer{},
 		Logger:   logger,
 	})

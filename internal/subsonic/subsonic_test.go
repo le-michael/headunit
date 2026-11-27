@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -124,6 +125,50 @@ func (noopStreamer) Close() error {
 	return nil
 }
 
+type stubUserStore struct {
+	mu         sync.Mutex
+	calls      atomic.Int64
+	lastLookup string
+	users      map[string]*store.User
+	err        error
+	returnNil  bool
+}
+
+func (s *stubUserStore) GetUserByUsername(_ context.Context, username string) (*store.User, error) {
+	s.calls.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastLookup = username
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.returnNil {
+		return nil, nil
+	}
+	for k, u := range s.users {
+		if strings.EqualFold(k, username) || (u != nil && strings.EqualFold(u.Username, username)) {
+			if u == nil {
+				return nil, nil
+			}
+			copyUser := *u
+			return &copyUser, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+func defaultTestUserStore() *stubUserStore {
+	return &stubUserStore{
+		users: map[string]*store.User{
+			"headunit": {ID: "usr_headunit", Username: "headunit"},
+			"alice":    {ID: "usr_alice", Username: "alice"},
+			"bob":      {ID: "usr_bob", Username: "bob"},
+			"listener": {ID: "usr_listener", Username: "listener"},
+			"user":     {ID: "usr_user", Username: "user"},
+		},
+	}
+}
+
 type xmlEnvelope struct {
 	XMLName                xml.Name                         `xml:"subsonic-response"`
 	Xmlns                  string                           `xml:"xmlns,attr"`
@@ -154,18 +199,25 @@ type jsonEnvelope struct {
 	SubsonicResponse map[string]any `json:"subsonic-response"`
 }
 
-func newTestHandler(t *testing.T, authImpl auth.Authenticator, scanImpl subsonic.ScanStatusProvider) http.Handler {
+func newTestHandlerWithUsers(t *testing.T, authImpl auth.Authenticator, scanImpl subsonic.ScanStatusProvider, users subsonic.UserStore, logger *slog.Logger) http.Handler {
 	t.Helper()
 	h, err := subsonic.NewHandler(subsonic.Dependencies{
 		Auth:     authImpl,
 		Scanner:  scanImpl,
 		Store:    noopLibraryStore{},
+		Users:    users,
 		Streamer: noopStreamer{},
+		Logger:   logger,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
 	return h
+}
+
+func newTestHandler(t *testing.T, authImpl auth.Authenticator, scanImpl subsonic.ScanStatusProvider) http.Handler {
+	t.Helper()
+	return newTestHandlerWithUsers(t, authImpl, scanImpl, defaultTestUserStore(), nil)
 }
 
 func assertCORSHeaders(t *testing.T, h http.Header) {
@@ -261,44 +313,52 @@ func assertJSONEnvelopeFields(t *testing.T, resp map[string]any, wantStatus stri
 
 func TestNewHandler_Validation(t *testing.T) {
 	scan := &atomicScanStatusProvider{}
+	users := &stubUserStore{}
 	tests := []struct {
 		name    string
 		deps    subsonic.Dependencies
-		wantErr bool
+		wantErr string
 	}{
 		{
 			name:    "nil auth",
-			deps:    subsonic.Dependencies{Auth: nil, Scanner: scan, Store: noopLibraryStore{}, Streamer: noopStreamer{}},
-			wantErr: true,
+			deps:    subsonic.Dependencies{Auth: nil, Scanner: scan, Store: noopLibraryStore{}, Users: users, Streamer: noopStreamer{}},
+			wantErr: "auth authenticator",
 		},
 		{
 			name:    "nil scanner",
-			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: nil, Store: noopLibraryStore{}, Streamer: noopStreamer{}},
-			wantErr: true,
+			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: nil, Store: noopLibraryStore{}, Users: users, Streamer: noopStreamer{}},
+			wantErr: "scanner status provider",
 		},
 		{
 			name:    "nil store",
-			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: nil, Streamer: noopStreamer{}},
-			wantErr: true,
+			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: nil, Users: users, Streamer: noopStreamer{}},
+			wantErr: "library store",
+		},
+		{
+			name:    "nil users",
+			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: noopLibraryStore{}, Users: nil, Streamer: noopStreamer{}},
+			wantErr: "user store",
 		},
 		{
 			name:    "nil streamer",
-			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: noopLibraryStore{}, Streamer: nil},
-			wantErr: true,
+			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: noopLibraryStore{}, Users: users, Streamer: nil},
+			wantErr: "streamer",
 		},
 		{
-			name:    "nil logger defaults cleanly",
-			deps:    subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: noopLibraryStore{}, Streamer: noopStreamer{}, Logger: nil},
-			wantErr: false,
+			name: "nil logger defaults cleanly",
+			deps: subsonic.Dependencies{Auth: auth.NoopAuthenticator{}, Scanner: scan, Store: noopLibraryStore{}, Users: users, Streamer: noopStreamer{}, Logger: nil},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			h, err := subsonic.NewHandler(tc.deps)
-			if tc.wantErr {
+			if tc.wantErr != "" {
 				if err == nil {
 					t.Fatalf("NewHandler() error = nil, want non-nil")
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("NewHandler() error = %q, want substring %q", err.Error(), tc.wantErr)
 				}
 				if h != nil {
 					t.Fatalf("NewHandler() handler = %v, want nil", h)
@@ -1062,6 +1122,139 @@ func TestAuthMiddlewareIntegration(t *testing.T) {
 	})
 }
 
+func assertAPIKeyAuthenticationExtension(t *testing.T, body []byte, isJSON bool) {
+	t.Helper()
+	if isJSON {
+		const wantFragment = `"openSubsonicExtensions":[{"name":"apiKeyAuthentication","versions":[1]}]`
+		if !strings.Contains(string(body), wantFragment) {
+			t.Errorf("JSON missing %s: %s", wantFragment, string(body))
+		}
+		m := decodeJSON(t, body)
+		assertJSONEnvelopeFields(t, m, "ok")
+		exts, ok := m["openSubsonicExtensions"].([]any)
+		if !ok || len(exts) != 1 {
+			t.Fatalf("JSON openSubsonicExtensions = %#v, want len 1", m["openSubsonicExtensions"])
+		}
+		ext, ok := exts[0].(map[string]any)
+		if !ok {
+			t.Fatalf("JSON openSubsonicExtensions[0] = %T, want map[string]any", exts[0])
+		}
+		if ext["name"] != "apiKeyAuthentication" {
+			t.Errorf("JSON extension name = %v, want apiKeyAuthentication", ext["name"])
+		}
+		versions, ok := ext["versions"].([]any)
+		if !ok || len(versions) != 1 || versions[0] != float64(1) {
+			t.Errorf("JSON extension versions = %#v, want [1]", ext["versions"])
+		}
+		return
+	}
+
+	const wantXML = `<openSubsonicExtensions name="apiKeyAuthentication"><versions>1</versions></openSubsonicExtensions>`
+	if !strings.Contains(string(body), wantXML) {
+		t.Errorf("XML missing %s: %s", wantXML, string(body))
+	}
+	env := decodeXML(t, body)
+	assertEnvelopeFields(t, env, "ok")
+	if len(env.OpenSubsonicExtensions) != 1 {
+		t.Fatalf("XML OpenSubsonicExtensions len = %d, want 1", len(env.OpenSubsonicExtensions))
+	}
+	got := env.OpenSubsonicExtensions[0]
+	if got.Name != "apiKeyAuthentication" || !slices.Equal(got.Versions, []int{1}) {
+		t.Errorf("XML OpenSubsonicExtensions[0] = %+v, want {Name:apiKeyAuthentication Versions:[1]}", got)
+	}
+}
+
+func assertUserResponse(t *testing.T, body []byte, isJSON bool, wantUsername string, wantAdmin bool) {
+	t.Helper()
+	assertNoCoverArt(t, body)
+	wantBools := map[string]bool{
+		"scrobblingEnabled":   false,
+		"adminRole":           wantAdmin,
+		"settingsRole":        false,
+		"downloadRole":        false,
+		"uploadRole":          false,
+		"playlistRole":        false,
+		"coverArtRole":        false,
+		"commentRole":         false,
+		"podcastRole":         false,
+		"streamRole":          true,
+		"jukeboxRole":         false,
+		"shareRole":           false,
+		"videoConversionRole": false,
+	}
+
+	if isJSON {
+		m := decodeJSON(t, body)
+		assertJSONEnvelopeFields(t, m, "ok")
+		u, ok := m["user"].(map[string]any)
+		if !ok {
+			t.Fatalf("JSON missing user object: %s", string(body))
+		}
+		if u["username"] != wantUsername {
+			t.Errorf("JSON user.username = %v, want %q", u["username"], wantUsername)
+		}
+		for k, wantVal := range wantBools {
+			gotVal, ok := u[k].(bool)
+			if !ok || gotVal != wantVal {
+				t.Errorf("JSON user[%q] = %v (present=%v), want %v", k, u[k], ok, wantVal)
+			}
+		}
+		folders, ok := u["folder"].([]any)
+		if !ok || len(folders) != 1 || folders[0] != float64(1) {
+			t.Errorf("JSON user.folder = %#v, want [1]", u["folder"])
+		}
+		return
+	}
+
+	rawXML := string(body)
+	for k, wantVal := range wantBools {
+		needle := k + `="` + strconv.FormatBool(wantVal) + `"`
+		if !strings.Contains(rawXML, needle) {
+			t.Errorf("XML missing %s in %s", needle, rawXML)
+		}
+	}
+	env := decodeXML(t, body)
+	assertEnvelopeFields(t, env, "ok")
+	if env.User == nil {
+		t.Fatalf("XML User = nil")
+	}
+	if env.User.Username != wantUsername || env.User.AdminRole != wantAdmin || !env.User.StreamRole || env.User.DownloadRole || !slices.Equal(env.User.Folder, []int{1}) {
+		t.Errorf("XML User = %+v, want Username=%q AdminRole=%v StreamRole=true Folder=[1]", env.User, wantUsername, wantAdmin)
+	}
+}
+
+func assertUserErrorResponse(t *testing.T, body []byte, isJSON bool, wantCode int, wantMsg string) {
+	t.Helper()
+	assertNoCoverArt(t, body)
+	if isJSON {
+		m := decodeJSON(t, body)
+		assertJSONEnvelopeFields(t, m, "failed")
+		if _, exists := m["user"]; exists {
+			t.Errorf("JSON unexpectedly included user on error: %s", string(body))
+		}
+		errObj, ok := m["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("JSON missing error object: %s", string(body))
+		}
+		if code, ok := errObj["code"].(float64); !ok || int(code) != wantCode {
+			t.Errorf("error.code = %v (ok=%v), want %d", errObj["code"], ok, wantCode)
+		}
+		if msg, _ := errObj["message"].(string); msg != wantMsg {
+			t.Errorf("error.message = %q, want %q", msg, wantMsg)
+		}
+		return
+	}
+
+	env := decodeXML(t, body)
+	assertEnvelopeFields(t, env, "failed")
+	if env.User != nil {
+		t.Errorf("XML unexpectedly included User on error: %+v", env.User)
+	}
+	if env.Error == nil || env.Error.Code != wantCode || env.Error.Message != wantMsg {
+		t.Errorf("XML error = %+v, want Code=%d Message=%q", env.Error, wantCode, wantMsg)
+	}
+}
+
 func TestSystemEndpoints(t *testing.T) {
 	scan := &atomicScanStatusProvider{}
 	h := newTestHandler(t, auth.NoopAuthenticator{}, scan)
@@ -1104,104 +1297,23 @@ func TestSystemEndpoints(t *testing.T) {
 	})
 
 	t.Run("getOpenSubsonicExtensions", func(t *testing.T) {
-		// XML: zero <openSubsonicExtensions> elements
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/rest/getOpenSubsonicExtensions", nil))
-		rawXML := rec.Body.String()
-		if strings.Contains(rawXML, "openSubsonicExtensions") {
-			t.Errorf("XML unexpectedly contains openSubsonicExtensions: %s", rawXML)
-		}
-		env := decodeXML(t, rec.Body.Bytes())
-		if len(env.OpenSubsonicExtensions) != 0 {
-			t.Errorf("XML OpenSubsonicExtensions len = %d, want 0", len(env.OpenSubsonicExtensions))
-		}
+		assertAPIKeyAuthenticationExtension(t, rec.Body.Bytes(), false)
 
-		// JSON: "openSubsonicExtensions":[]
 		rec = httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/rest/getOpenSubsonicExtensions?f=json", nil))
-		rawJSON := rec.Body.String()
-		if !strings.Contains(rawJSON, `"openSubsonicExtensions":[]`) {
-			t.Errorf(`JSON missing "openSubsonicExtensions":[]: %s`, rawJSON)
-		}
-		m := decodeJSON(t, rec.Body.Bytes())
-		exts, ok := m["openSubsonicExtensions"].([]any)
-		if !ok || len(exts) != 0 {
-			t.Errorf("JSON openSubsonicExtensions = %#v, want empty slice", m["openSubsonicExtensions"])
-		}
+		assertAPIKeyAuthenticationExtension(t, rec.Body.Bytes(), true)
 	})
 
-	t.Run("getUser precedence and full schema", func(t *testing.T) {
-		precedenceCases := []struct {
-			name          string
-			principalUser string
-			query         string
-			wantUser      string
-		}{
-			{name: "username overrides principal", principalUser: "alice", query: "?username=%20charlie%20&f=json", wantUser: "charlie"},
-			{name: "blank username falls back to principal", principalUser: "alice", query: "?username=%20%20&f=json", wantUser: "alice"},
-			{name: "blank principal falls back to headunit", principalUser: "  ", query: "?f=json", wantUser: "headunit"},
-		}
-		for _, tc := range precedenceCases {
-			t.Run(tc.name, func(t *testing.T) {
-				uh := newTestHandler(t, &stubAuthenticator{principal: auth.Principal{Username: tc.principalUser}}, scan)
-				rec := httptest.NewRecorder()
-				uh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/rest/getUser"+tc.query, nil))
-				m := decodeJSON(t, rec.Body.Bytes())
-				u := m["user"].(map[string]any)
-				if u["username"] != tc.wantUser {
-					t.Errorf("username = %v, want %q", u["username"], tc.wantUser)
-				}
-			})
-		}
-
-		// Verify all 13 booleans + folder: [1] in JSON and XML, and no coverArt key.
+	t.Run("getUser self schema", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/rest/getUser?f=json", nil))
-		assertNoCoverArt(t, rec.Body.Bytes())
-		m := decodeJSON(t, rec.Body.Bytes())
-		u := m["user"].(map[string]any)
+		assertUserResponse(t, rec.Body.Bytes(), true, "headunit", false)
 
-		wantBools := map[string]bool{
-			"scrobblingEnabled":   false,
-			"adminRole":           false,
-			"settingsRole":        false,
-			"downloadRole":        false,
-			"uploadRole":          false,
-			"playlistRole":        false,
-			"coverArtRole":        false,
-			"commentRole":         false,
-			"podcastRole":         false,
-			"streamRole":          true,
-			"jukeboxRole":         false,
-			"shareRole":           false,
-			"videoConversionRole": false,
-		}
-		for k, wantVal := range wantBools {
-			gotVal, ok := u[k].(bool)
-			if !ok || gotVal != wantVal {
-				t.Errorf("JSON user[%q] = %v (present=%v), want %v", k, u[k], ok, wantVal)
-			}
-		}
-		folders, ok := u["folder"].([]any)
-		if !ok || len(folders) != 1 || folders[0] != float64(1) {
-			t.Errorf("JSON user.folder = %#v, want [1]", u["folder"])
-		}
-
-		// XML check
 		rec = httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/rest/getUser", nil))
-		assertNoCoverArt(t, rec.Body.Bytes())
-		rawXML := rec.Body.String()
-		for k, wantVal := range wantBools {
-			needle := k + `="` + strconv.FormatBool(wantVal) + `"`
-			if !strings.Contains(rawXML, needle) {
-				t.Errorf("XML missing %s in %s", needle, rawXML)
-			}
-		}
-		env := decodeXML(t, rec.Body.Bytes())
-		if env.User == nil || !slices.Equal(env.User.Folder, []int{1}) || !env.User.StreamRole || env.User.DownloadRole {
-			t.Errorf("XML User = %+v", env.User)
-		}
+		assertUserResponse(t, rec.Body.Bytes(), false, "headunit", false)
 	})
 
 	t.Run("getScanStatus zero and non-UTC", func(t *testing.T) {
@@ -1478,30 +1590,6 @@ func TestGetOpenSubsonicExtensionsPublicBypass(t *testing.T) {
 
 	client := srv.Client()
 
-	assertEmptyExtensions := func(t *testing.T, body []byte, isJSON bool) {
-		t.Helper()
-		if isJSON {
-			if !strings.Contains(string(body), `"openSubsonicExtensions":[]`) {
-				t.Errorf(`JSON missing "openSubsonicExtensions":[]: %s`, string(body))
-			}
-			m := decodeJSON(t, body)
-			assertJSONEnvelopeFields(t, m, "ok")
-			exts, ok := m["openSubsonicExtensions"].([]any)
-			if !ok || len(exts) != 0 {
-				t.Errorf("JSON openSubsonicExtensions = %#v, want empty slice", m["openSubsonicExtensions"])
-			}
-			return
-		}
-		if strings.Contains(string(body), "openSubsonicExtensions") {
-			t.Errorf("XML unexpectedly contains openSubsonicExtensions: %s", string(body))
-		}
-		env := decodeXML(t, body)
-		assertEnvelopeFields(t, env, "ok")
-		if len(env.OpenSubsonicExtensions) != 0 {
-			t.Errorf("XML OpenSubsonicExtensions len = %d, want 0", len(env.OpenSubsonicExtensions))
-		}
-	}
-
 	for _, suffix := range []string{"", ".view"} {
 		path := "/rest/getOpenSubsonicExtensions" + suffix
 		for _, format := range []string{"", "json"} {
@@ -1523,7 +1611,7 @@ func TestGetOpenSubsonicExtensionsPublicBypass(t *testing.T) {
 					t.Fatalf("GET status = %d, want 200", getResp.StatusCode)
 				}
 				assertCORSHeaders(t, getResp.Header)
-				assertEmptyExtensions(t, getBody, isJSON)
+				assertAPIKeyAuthenticationExtension(t, getBody, isJSON)
 
 				// HEAD
 				headResp, err := client.Head(srv.URL + path + query)
@@ -1558,7 +1646,7 @@ func TestGetOpenSubsonicExtensionsPublicBypass(t *testing.T) {
 					t.Fatalf("POST form status = %d, want 200", postFormResp.StatusCode)
 				}
 				assertCORSHeaders(t, postFormResp.Header)
-				assertEmptyExtensions(t, postFormBody, isJSON)
+				assertAPIKeyAuthenticationExtension(t, postFormBody, isJSON)
 
 				// POST query-only
 				postQueryResp, err := client.Post(srv.URL+path+query, "application/x-www-form-urlencoded", nil)
@@ -1571,7 +1659,7 @@ func TestGetOpenSubsonicExtensionsPublicBypass(t *testing.T) {
 					t.Fatalf("POST query status = %d, want 200", postQueryResp.StatusCode)
 				}
 				assertCORSHeaders(t, postQueryResp.Header)
-				assertEmptyExtensions(t, postQueryBody, isJSON)
+				assertAPIKeyAuthenticationExtension(t, postQueryBody, isJSON)
 			})
 		}
 	}
@@ -1905,6 +1993,262 @@ func TestTokenInfo(t *testing.T) {
 			assertCORSHeaders(t, resp.Header)
 		}
 	})
+}
+
+func TestGetUser(t *testing.T) {
+	scan := &atomicScanStatusProvider{}
+
+	baseUsers := func() map[string]*store.User {
+		return map[string]*store.User{
+			"Alice": {ID: "usr_alice", Username: "Alice", IsAdmin: false},
+			"bob":   {ID: "usr_bob", Username: "bob", IsAdmin: false},
+			"admin": {ID: "usr_admin", Username: "Admin", IsAdmin: true},
+		}
+	}
+
+	successCases := []struct {
+		name         string
+		principal    auth.Principal
+		method       string
+		query        string
+		body         string
+		wantUsername string
+		wantAdmin    bool
+	}{
+		{
+			name:         "self omitted username",
+			principal:    auth.Principal{Username: "Alice", IsAdmin: false},
+			method:       http.MethodGet,
+			wantUsername: "Alice",
+			wantAdmin:    false,
+		},
+		{
+			name:         "self blank username falls back to principal",
+			principal:    auth.Principal{Username: "bob", IsAdmin: false},
+			method:       http.MethodGet,
+			query:        "username=%20%20",
+			wantUsername: "bob",
+			wantAdmin:    false,
+		},
+		{
+			name:         "self matching username",
+			principal:    auth.Principal{Username: "bob", IsAdmin: false},
+			method:       http.MethodGet,
+			query:        "username=bob",
+			wantUsername: "bob",
+			wantAdmin:    false,
+		},
+		{
+			name:         "self case-insensitive returns canonical store username",
+			principal:    auth.Principal{Username: "ALICE", IsAdmin: false},
+			method:       http.MethodGet,
+			query:        "username=%20aLiCe%20",
+			wantUsername: "Alice",
+			wantAdmin:    false,
+		},
+		{
+			name:         "self POST form username",
+			principal:    auth.Principal{Username: "alice", IsAdmin: false},
+			method:       http.MethodPost,
+			body:         "username=ALICE",
+			wantUsername: "Alice",
+			wantAdmin:    false,
+		},
+		{
+			name:         "admin self returns adminRole true and canonical username",
+			principal:    auth.Principal{Username: "admin", IsAdmin: true},
+			method:       http.MethodGet,
+			wantUsername: "Admin",
+			wantAdmin:    true,
+		},
+		{
+			name:         "admin querying other existing user",
+			principal:    auth.Principal{Username: "admin", IsAdmin: true},
+			method:       http.MethodGet,
+			query:        "username=alice",
+			wantUsername: "Alice",
+			wantAdmin:    false,
+		},
+	}
+
+	for _, tc := range successCases {
+		for _, format := range []string{"xml", "json"} {
+			isJSON := format == "json"
+			t.Run(tc.name+"_"+format, func(t *testing.T) {
+				userStore := &stubUserStore{users: baseUsers()}
+				h := newTestHandlerWithUsers(t, &stubAuthenticator{principal: tc.principal}, scan, userStore, nil)
+
+				target := "/rest/getUser"
+				q := tc.query
+				formBody := tc.body
+				if isJSON {
+					if tc.method == http.MethodPost && formBody != "" {
+						formBody += "&f=json"
+					} else if q != "" {
+						q += "&f=json"
+					} else {
+						q = "f=json"
+					}
+				}
+				if q != "" {
+					target += "?" + q
+				}
+
+				res, body := execSubsonicRequest(t, h, tc.method, target, formBody)
+				if res.StatusCode != http.StatusOK {
+					t.Fatalf("status = %d, want 200", res.StatusCode)
+				}
+				assertCORSHeaders(t, res.Header)
+				assertUserResponse(t, body, isJSON, tc.wantUsername, tc.wantAdmin)
+				if got := userStore.calls.Load(); got != 1 {
+					t.Errorf("GetUserByUsername calls = %d, want 1", got)
+				}
+			})
+		}
+	}
+
+	const (
+		msgNotAuthorized = "User is not authorized for the given operation"
+		msgNotFound      = "User not found"
+		secretErrText    = "secret-sqlite-path /data/headunit.db"
+	)
+
+	errorCases := []struct {
+		name      string
+		principal auth.Principal
+		store     *stubUserStore
+		method    string
+		query     string
+		body      string
+		wantCode  int
+		wantMsg   string
+		wantCalls int64
+		secretLog string
+	}{
+		{
+			name:      "non-admin querying existing other user returns 50 without querying store",
+			principal: auth.Principal{Username: "bob", IsAdmin: false},
+			store:     &stubUserStore{users: baseUsers()},
+			method:    http.MethodGet,
+			query:     "username=alice",
+			wantCode:  50,
+			wantMsg:   msgNotAuthorized,
+			wantCalls: 0,
+		},
+		{
+			name:      "non-admin POST querying existing other user returns 50 without querying store",
+			principal: auth.Principal{Username: "bob", IsAdmin: false},
+			store:     &stubUserStore{users: baseUsers()},
+			method:    http.MethodPost,
+			body:      "username=alice",
+			wantCode:  50,
+			wantMsg:   msgNotAuthorized,
+			wantCalls: 0,
+		},
+		{
+			name:      "non-admin querying unknown user returns 50 without querying store",
+			principal: auth.Principal{Username: "bob", IsAdmin: false},
+			store:     &stubUserStore{users: baseUsers()},
+			method:    http.MethodGet,
+			query:     "username=ghost",
+			wantCode:  50,
+			wantMsg:   msgNotAuthorized,
+			wantCalls: 0,
+		},
+		{
+			name:      "admin querying unknown user returns 70",
+			principal: auth.Principal{Username: "admin", IsAdmin: true},
+			store:     &stubUserStore{users: baseUsers()},
+			method:    http.MethodGet,
+			query:     "username=ghost",
+			wantCode:  70,
+			wantMsg:   msgNotFound,
+			wantCalls: 1,
+		},
+		{
+			name:      "nil user without error returns 70",
+			principal: auth.Principal{Username: "admin", IsAdmin: true},
+			store:     &stubUserStore{returnNil: true},
+			method:    http.MethodGet,
+			query:     "username=alice",
+			wantCode:  70,
+			wantMsg:   msgNotFound,
+			wantCalls: 1,
+		},
+		{
+			name:      "unexpected store error returns sanitized 0 and logs details",
+			principal: auth.Principal{Username: "alice", IsAdmin: false},
+			store:     &stubUserStore{err: errors.New(secretErrText)},
+			method:    http.MethodGet,
+			wantCode:  0,
+			wantMsg:   "Internal server error",
+			wantCalls: 1,
+			secretLog: secretErrText,
+		},
+		{
+			name:      "blank non-admin principal with omitted username fails closed with 50",
+			principal: auth.Principal{Username: "  ", IsAdmin: false},
+			store:     &stubUserStore{users: baseUsers()},
+			method:    http.MethodGet,
+			wantCode:  50,
+			wantMsg:   msgNotAuthorized,
+			wantCalls: 0,
+		},
+		{
+			name:      "blank admin principal with blank username fails closed with 50",
+			principal: auth.Principal{Username: "  ", IsAdmin: true},
+			store:     &stubUserStore{users: baseUsers()},
+			method:    http.MethodGet,
+			query:     "username=%20%20",
+			wantCode:  50,
+			wantMsg:   msgNotAuthorized,
+			wantCalls: 0,
+		},
+	}
+
+	for _, tc := range errorCases {
+		for _, format := range []string{"xml", "json"} {
+			isJSON := format == "json"
+			t.Run(tc.name+"_"+format, func(t *testing.T) {
+				tc.store.calls.Store(0)
+				var logBuf bytes.Buffer
+				logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+				h := newTestHandlerWithUsers(t, &stubAuthenticator{principal: tc.principal}, scan, tc.store, logger)
+
+				target := "/rest/getUser"
+				q := tc.query
+				formBody := tc.body
+				if isJSON {
+					if tc.method == http.MethodPost && formBody != "" {
+						formBody += "&f=json"
+					} else if q != "" {
+						q += "&f=json"
+					} else {
+						q = "f=json"
+					}
+				}
+				if q != "" {
+					target += "?" + q
+				}
+
+				res, body := execSubsonicRequest(t, h, tc.method, target, formBody)
+				if res.StatusCode != http.StatusOK {
+					t.Fatalf("status = %d, want 200", res.StatusCode)
+				}
+				assertCORSHeaders(t, res.Header)
+				if tc.secretLog != "" && strings.Contains(string(body), tc.secretLog) {
+					t.Fatalf("response leaked internal error: %s", string(body))
+				}
+				assertUserErrorResponse(t, body, isJSON, tc.wantCode, tc.wantMsg)
+				if got := tc.store.calls.Load(); got != tc.wantCalls {
+					t.Errorf("GetUserByUsername calls = %d, want %d", got, tc.wantCalls)
+				}
+				if tc.secretLog != "" && !strings.Contains(logBuf.String(), tc.secretLog) {
+					t.Errorf("expected slog output to contain %q, got %q", tc.secretLog, logBuf.String())
+				}
+			})
+		}
+	}
 }
 
 func TestConcurrentRequests(t *testing.T) {
