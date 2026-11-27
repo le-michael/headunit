@@ -45,8 +45,8 @@ jobs:
           go mod verify
       - name: Validate shell scripts and Docker Compose config
         run: |
-          test -x entrypoint.sh && test -x scripts/ci/docker-e2e.sh
-          sh -n entrypoint.sh && bash -n scripts/ci/docker-e2e.sh
+          test -x scripts/entrypoint.sh && test -x scripts/headunit-ctl.sh && test -x scripts/ci/docker-e2e.sh
+          sh -n scripts/entrypoint.sh && bash -n scripts/headunit-ctl.sh && bash -n scripts/ci/docker-e2e.sh
           MUSIC_DIR=/tmp docker compose config --quiet
 
   unit-tests:

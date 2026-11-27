@@ -13,7 +13,7 @@ FROM alpine:3.23
 RUN apk add --no-cache ffmpeg su-exec
 
 COPY --from=builder /out/headunit /usr/local/bin/headunit
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /data /music
 

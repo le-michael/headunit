@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -39,6 +40,32 @@ type server struct {
 }
 
 func main() {
+	if len(os.Args) <= 1 {
+		runServerMain()
+		return
+	}
+	if os.Args[1] == "serve" {
+		if err := parseServeArgs(os.Args[2:], os.Stderr); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "headunit serve: %v\n", err)
+			os.Exit(1)
+		}
+		runServerMain()
+		return
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err := runCLI(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	stop()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "headunit: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runServerMain() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	if err := run(context.Background(), logger); err != nil {
 		logger.Error("headunit exited with error", "error", err)

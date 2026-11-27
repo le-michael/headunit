@@ -79,11 +79,20 @@ export DATA_DIR
 export HOME="$DATA_DIR"
 export XDG_CACHE_HOME="$DATA_DIR/.cache"
 
-if [ "$(id -u)" = "0" ]; then
+if [ "$#" -eq 0 ] || [ "${1:-}" = "serve" ]; then
     mkdir -p "$DATA_DIR/.cache"
-    chown -R "$PUID:$PGID" "$DATA_DIR"
-    exec su-exec "$PUID:$PGID" /usr/local/bin/headunit
+    if [ "$(id -u)" = "0" ]; then
+        chown -R "$PUID:$PGID" "$DATA_DIR"
+        exec su-exec "$PUID:$PGID" /usr/local/bin/headunit ${1+"$@"}
+    else
+        exec /usr/local/bin/headunit ${1+"$@"}
+    fi
 else
-    mkdir -p "$DATA_DIR/.cache"
-    exec /usr/local/bin/headunit
+    if [ "$(id -u)" = "0" ]; then
+        mkdir -p "$DATA_DIR"
+        chown "$PUID:$PGID" "$DATA_DIR"
+        exec su-exec "$PUID:$PGID" /usr/local/bin/headunit "$@"
+    else
+        exec /usr/local/bin/headunit "$@"
+    fi
 fi
