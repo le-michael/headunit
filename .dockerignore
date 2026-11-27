@@ -6,5 +6,6 @@
 *.db-shm
 /headunit
 .github
-scripts
+scripts/*
+!scripts/entrypoint.sh
 e2e
