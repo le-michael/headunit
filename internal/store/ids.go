@@ -12,9 +12,11 @@ const (
 	artistIDPrefix = "ar_"
 	albumIDPrefix  = "al_"
 	trackIDPrefix  = "tr_"
+	userIDPrefix   = "usr_"
+	apiKeyIDPrefix = "key_"
 
 	derivedIDBytes = 8
-	trackIDBytes   = 16
+	opaqueIDBytes  = 16
 )
 
 // ArtistID derives a deterministic, case- and whitespace-normalized artist
@@ -39,9 +41,25 @@ func AlbumID(albumArtist, album string) string {
 // NewTrackID generates an opaque random track identifier ("tr_" + 32 hex chars)
 // using crypto/rand.
 func NewTrackID() (string, error) {
-	var buf [trackIDBytes]byte
+	return newOpaqueID(trackIDPrefix, "track")
+}
+
+// NewUserID generates an opaque random user identifier ("usr_" + 32 hex chars)
+// using crypto/rand.
+func NewUserID() (string, error) {
+	return newOpaqueID(userIDPrefix, "user")
+}
+
+// NewAPIKeyID generates an opaque random API key identifier ("key_" + 32 hex
+// chars) using crypto/rand.
+func NewAPIKeyID() (string, error) {
+	return newOpaqueID(apiKeyIDPrefix, "api key")
+}
+
+func newOpaqueID(prefix, kind string) (string, error) {
+	var buf [opaqueIDBytes]byte
 	if _, err := rand.Read(buf[:]); err != nil {
-		return "", fmt.Errorf("store: generate track id: %w", err)
+		return "", fmt.Errorf("store: generate %s id: %w", kind, err)
 	}
-	return trackIDPrefix + hex.EncodeToString(buf[:]), nil
+	return prefix + hex.EncodeToString(buf[:]), nil
 }

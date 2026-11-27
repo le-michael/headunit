@@ -76,11 +76,14 @@ func TestOpenAndClose(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = s.Close() })
 
-		// Verify tracks table and both composite indexes exist in sqlite_master.
+		// Verify v2 tables and indexes exist in sqlite_master.
 		wantObjects := map[string]string{
 			"tracks":               "table",
 			"idx_tracks_artist_id": "index",
 			"idx_tracks_album_id":  "index",
+			"users":                "table",
+			"api_keys":             "table",
+			"idx_api_keys_user_id": "index",
 		}
 		for name, wantType := range wantObjects {
 			var gotType string
@@ -113,7 +116,7 @@ func TestOpenAndClose(t *testing.T) {
 			{"PRAGMA synchronous", 1}, // NORMAL
 			{"PRAGMA foreign_keys", 1},
 			{"PRAGMA busy_timeout", 5000},
-			{"PRAGMA user_version", 1},
+			{"PRAGMA user_version", 2},
 		}
 		for _, tc := range writeIntPragmas {
 			var got int
@@ -256,8 +259,83 @@ func TestOpenAndClose(t *testing.T) {
 		}
 	})
 
+	t.Run("migrates v1 database to v2 preserving tracks", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "v1.db")
+		rawDB, err := sql.Open("sqlite", buildDSN(dbPath, writeDSNQuery))
+		if err != nil {
+			t.Fatalf("raw sql.Open() error: %v", err)
+		}
+		for _, stmt := range schemaV1Statements {
+			if _, err := rawDB.ExecContext(ctx, stmt.sql); err != nil {
+				_ = rawDB.Close()
+				t.Fatalf("seed v1 %s: %v", stmt.name, err)
+			}
+		}
+		seedArtistID := ArtistID("Boards of Canada")
+		seedAlbumID := AlbumID("Boards of Canada", "Geogaddi")
+		if _, err := rawDB.ExecContext(ctx,
+			`INSERT INTO tracks (
+				id, rel_path, file_size, mtime_ns, title, artist, album_artist,
+				artist_id, album, album_id, track_num, disc_num, year, genre,
+				duration_sec, bit_rate, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			"tr_v1_legacy", "boc/geogaddi/01.flac", 2048, 1700000000, "Ready Lets Go",
+			"Boards of Canada", "Boards of Canada", seedArtistID, "Geogaddi", seedAlbumID,
+			1, 1, 2002, "IDM", 59, 900, "2025-01-15T12:00:00Z",
+		); err != nil {
+			_ = rawDB.Close()
+			t.Fatalf("seed v1 track: %v", err)
+		}
+		if err := rawDB.Close(); err != nil {
+			t.Fatalf("raw Close() error: %v", err)
+		}
+
+		s, err := Open(ctx, dbPath)
+		if err != nil {
+			t.Fatalf("Open() v1->v2 migration error: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+
+		var version int
+		if err := s.readDB.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+			t.Fatalf("PRAGMA user_version error: %v", err)
+		}
+		if version != 2 {
+			t.Errorf("migrated user_version = %d, want 2", version)
+		}
+
+		for name, wantType := range map[string]string{
+			"users":                "table",
+			"api_keys":             "table",
+			"idx_api_keys_user_id": "index",
+		} {
+			var gotType string
+			if err := s.readDB.QueryRowContext(ctx, "SELECT type FROM sqlite_master WHERE name = ?", name).Scan(&gotType); err != nil {
+				t.Fatalf("sqlite_master lookup for %q failed: %v", name, err)
+			}
+			if gotType != wantType {
+				t.Errorf("sqlite_master[%q] type = %q, want %q", name, gotType, wantType)
+			}
+		}
+
+		count, err := s.TrackCount(ctx)
+		if err != nil {
+			t.Fatalf("TrackCount() after migration error: %v", err)
+		}
+		if count != 1 {
+			t.Errorf("TrackCount() after migration = %d, want 1", count)
+		}
+		got, err := s.GetTrack(ctx, "tr_v1_legacy")
+		if err != nil {
+			t.Fatalf("GetTrack(tr_v1_legacy) after migration error: %v", err)
+		}
+		if got.Title != "Ready Lets Go" || got.RelPath != "boc/geogaddi/01.flac" {
+			t.Errorf("migrated track = %+v, want preserved v1 fields", *got)
+		}
+	})
+
 	t.Run("rejects unsupported schema versions", func(t *testing.T) {
-		for _, badVersion := range []int{-1, 2} {
+		for _, badVersion := range []int{-1, 3} {
 			t.Run(fmt.Sprintf("user_version_%d", badVersion), func(t *testing.T) {
 				dbPath := filepath.Join(t.TempDir(), "badver.db")
 				s, err := Open(ctx, dbPath)
@@ -353,22 +431,35 @@ func TestIDs(t *testing.T) {
 	})
 
 	t.Run("NewTrackID format and uniqueness", func(t *testing.T) {
-		seen := make(map[string]struct{}, 100)
-		for range 100 {
-			id, err := NewTrackID()
-			if err != nil {
-				t.Fatalf("NewTrackID() unexpected error: %v", err)
-			}
-			if !strings.HasPrefix(id, "tr_") || len(id) != 35 {
-				t.Fatalf("NewTrackID() = %q (len %d), want prefix tr_ and len 35", id, len(id))
-			}
-			assertHexLower(t, strings.TrimPrefix(id, "tr_"))
-			if _, dup := seen[id]; dup {
-				t.Fatalf("NewTrackID() generated duplicate ID %q", id)
-			}
-			seen[id] = struct{}{}
-		}
+		assertOpaqueIDGenerator(t, "tr_", 35, NewTrackID)
 	})
+
+	t.Run("NewUserID format and uniqueness", func(t *testing.T) {
+		assertOpaqueIDGenerator(t, "usr_", 36, NewUserID)
+	})
+
+	t.Run("NewAPIKeyID format and uniqueness", func(t *testing.T) {
+		assertOpaqueIDGenerator(t, "key_", 36, NewAPIKeyID)
+	})
+}
+
+func assertOpaqueIDGenerator(t *testing.T, prefix string, wantLen int, gen func() (string, error)) {
+	t.Helper()
+	seen := make(map[string]struct{}, 100)
+	for range 100 {
+		id, err := gen()
+		if err != nil {
+			t.Fatalf("generator unexpected error: %v", err)
+		}
+		if !strings.HasPrefix(id, prefix) || len(id) != wantLen {
+			t.Fatalf("generated ID = %q (len %d), want prefix %s and len %d", id, len(id), prefix, wantLen)
+		}
+		assertHexLower(t, strings.TrimPrefix(id, prefix))
+		if _, dup := seen[id]; dup {
+			t.Fatalf("generator produced duplicate ID %q", id)
+		}
+		seen[id] = struct{}{}
+	}
 }
 
 func TestUpsertTrack_InPlaceEditAndValidation(t *testing.T) {
