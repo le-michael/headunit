@@ -135,6 +135,7 @@ type xmlEnvelope struct {
 	Error                  *subsonic.APIError               `xml:"error"`
 	License                *subsonic.License                `xml:"license"`
 	OpenSubsonicExtensions []subsonic.OpenSubsonicExtension `xml:"openSubsonicExtensions"`
+	TokenInfo              *subsonic.TokenInfo              `xml:"tokenInfo"`
 	User                   *subsonic.User                   `xml:"user"`
 	ScanStatus             *subsonic.ScanStatus             `xml:"scanStatus"`
 	Playlists              *subsonic.Playlists              `xml:"playlists"`
@@ -561,6 +562,7 @@ func TestDualRoutesAndHTTPMethods(t *testing.T) {
 		{name: "ping", wantStatus: "ok"},
 		{name: "getLicense", wantStatus: "ok"},
 		{name: "getOpenSubsonicExtensions", wantStatus: "ok"},
+		{name: "tokenInfo", wantStatus: "failed"},
 		{name: "getUser", wantStatus: "ok"},
 		{name: "getScanStatus", wantStatus: "ok"},
 		{name: "getGenres", wantStatus: "ok"},
@@ -671,7 +673,7 @@ func TestDualRoutesAndHTTPMethods(t *testing.T) {
 		authSrv := httptest.NewServer(authHandler)
 		defer authSrv.Close()
 
-		for _, path := range []string{"/rest/ping", "/rest/unknownPath"} {
+		for _, path := range []string{"/rest/ping", "/rest/getOpenSubsonicExtensions", "/rest/tokenInfo", "/rest/unknownPath"} {
 			req, err := http.NewRequest(http.MethodOptions, authSrv.URL+path, nil)
 			if err != nil {
 				t.Fatalf("NewRequest error = %v", err)
@@ -1337,6 +1339,574 @@ func TestCompatibilityStubs(t *testing.T) {
 	})
 }
 
+func TestHealthz(t *testing.T) {
+	scan := &atomicScanStatusProvider{}
+	failingAuth := &stubAuthenticator{err: errors.New("auth must not run")}
+	h := newTestHandler(t, failingAuth, scan)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	client := srv.Client()
+
+	assertHealthzHeaders := func(t *testing.T, hdr http.Header) {
+		t.Helper()
+		if got := hdr.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want %q", got, "text/plain; charset=utf-8")
+		}
+		if got := hdr.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("X-Content-Type-Options = %q, want %q", got, "nosniff")
+		}
+		if got := hdr.Get("Content-Length"); got != "3" {
+			t.Errorf("Content-Length = %q, want %q", got, "3")
+		}
+		if got := hdr.Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want empty", got)
+		}
+	}
+
+	t.Run("GET /healthz", func(t *testing.T) {
+		resp, err := client.Get(srv.URL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz error = %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		assertHealthzHeaders(t, resp.Header)
+		if string(body) != "ok\n" {
+			t.Errorf("body = %q, want %q", string(body), "ok\n")
+		}
+	})
+
+	t.Run("HEAD /healthz", func(t *testing.T) {
+		resp, err := client.Head(srv.URL + "/healthz")
+		if err != nil {
+			t.Fatalf("HEAD /healthz error = %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		assertHealthzHeaders(t, resp.Header)
+		if len(body) != 0 {
+			t.Errorf("HEAD body len = %d, want 0", len(body))
+		}
+
+		req := httptest.NewRequest(http.MethodHead, "/healthz", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("recorder status = %d, want 200", rec.Code)
+		}
+		assertHealthzHeaders(t, rec.Header())
+		if rec.Body.Len() != 0 {
+			t.Errorf("recorder HEAD body = %q (len=%d), want empty", rec.Body.String(), rec.Body.Len())
+		}
+	})
+
+	t.Run("GET /healthz with malformed query string bypasses form parsing", func(t *testing.T) {
+		resp, err := client.Get(srv.URL + "/healthz?bad=%ZZ")
+		if err != nil {
+			t.Fatalf("GET /healthz?bad=%%ZZ error = %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if string(body) != "ok\n" {
+			t.Errorf("body = %q, want %q", string(body), "ok\n")
+		}
+	})
+
+	t.Run("disallowed methods return 405 without CORS", func(t *testing.T) {
+		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions} {
+			req, err := http.NewRequest(method, srv.URL+"/healthz", nil)
+			if err != nil {
+				t.Fatalf("NewRequest error = %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("%s /healthz error = %v", method, err)
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("%s status = %d, want 405", method, resp.StatusCode)
+			}
+			if allow := resp.Header.Get("Allow"); !strings.Contains(allow, "GET") || !strings.Contains(allow, "HEAD") {
+				t.Errorf("%s Allow = %q, want GET and HEAD", method, allow)
+			}
+			if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+				t.Errorf("%s Access-Control-Allow-Origin = %q, want empty", method, got)
+			}
+		}
+	})
+
+	t.Run("unknown non-rest path returns 404", func(t *testing.T) {
+		resp, err := client.Get(srv.URL + "/doesNotExist")
+		if err != nil {
+			t.Fatalf("GET /doesNotExist error = %v", err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want empty", got)
+		}
+	})
+
+	if calls := failingAuth.calls.Load(); calls != 0 {
+		t.Errorf("Authenticator calls during /healthz tests = %d, want 0", calls)
+	}
+}
+
+func TestGetOpenSubsonicExtensionsPublicBypass(t *testing.T) {
+	scan := &atomicScanStatusProvider{}
+	failingAuth := &stubAuthenticator{err: errors.New("auth must not run")}
+	h := newTestHandler(t, failingAuth, scan)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	client := srv.Client()
+
+	assertEmptyExtensions := func(t *testing.T, body []byte, isJSON bool) {
+		t.Helper()
+		if isJSON {
+			if !strings.Contains(string(body), `"openSubsonicExtensions":[]`) {
+				t.Errorf(`JSON missing "openSubsonicExtensions":[]: %s`, string(body))
+			}
+			m := decodeJSON(t, body)
+			assertJSONEnvelopeFields(t, m, "ok")
+			exts, ok := m["openSubsonicExtensions"].([]any)
+			if !ok || len(exts) != 0 {
+				t.Errorf("JSON openSubsonicExtensions = %#v, want empty slice", m["openSubsonicExtensions"])
+			}
+			return
+		}
+		if strings.Contains(string(body), "openSubsonicExtensions") {
+			t.Errorf("XML unexpectedly contains openSubsonicExtensions: %s", string(body))
+		}
+		env := decodeXML(t, body)
+		assertEnvelopeFields(t, env, "ok")
+		if len(env.OpenSubsonicExtensions) != 0 {
+			t.Errorf("XML OpenSubsonicExtensions len = %d, want 0", len(env.OpenSubsonicExtensions))
+		}
+	}
+
+	for _, suffix := range []string{"", ".view"} {
+		path := "/rest/getOpenSubsonicExtensions" + suffix
+		for _, format := range []string{"", "json"} {
+			isJSON := format == "json"
+			query := ""
+			if isJSON {
+				query = "?f=json"
+			}
+
+			t.Run("routes"+suffix+"_"+format, func(t *testing.T) {
+				// GET
+				getResp, err := client.Get(srv.URL + path + query)
+				if err != nil {
+					t.Fatalf("GET %s error = %v", path, err)
+				}
+				getBody, _ := io.ReadAll(getResp.Body)
+				getResp.Body.Close()
+				if getResp.StatusCode != http.StatusOK {
+					t.Fatalf("GET status = %d, want 200", getResp.StatusCode)
+				}
+				assertCORSHeaders(t, getResp.Header)
+				assertEmptyExtensions(t, getBody, isJSON)
+
+				// HEAD
+				headResp, err := client.Head(srv.URL + path + query)
+				if err != nil {
+					t.Fatalf("HEAD %s error = %v", path, err)
+				}
+				headBody, _ := io.ReadAll(headResp.Body)
+				headResp.Body.Close()
+				if headResp.StatusCode != http.StatusOK {
+					t.Fatalf("HEAD status = %d, want 200", headResp.StatusCode)
+				}
+				assertCORSHeaders(t, headResp.Header)
+				if len(headBody) != 0 {
+					t.Errorf("HEAD body len = %d, want 0", len(headBody))
+				}
+				if got, want := headResp.Header.Get("Content-Length"), strconv.Itoa(len(getBody)); got != want {
+					t.Errorf("HEAD Content-Length = %q, want %q", got, want)
+				}
+
+				// POST form
+				form := url.Values{}
+				if isJSON {
+					form.Set("f", "json")
+				}
+				postFormResp, err := client.PostForm(srv.URL+path, form)
+				if err != nil {
+					t.Fatalf("POST form %s error = %v", path, err)
+				}
+				postFormBody, _ := io.ReadAll(postFormResp.Body)
+				postFormResp.Body.Close()
+				if postFormResp.StatusCode != http.StatusOK {
+					t.Fatalf("POST form status = %d, want 200", postFormResp.StatusCode)
+				}
+				assertCORSHeaders(t, postFormResp.Header)
+				assertEmptyExtensions(t, postFormBody, isJSON)
+
+				// POST query-only
+				postQueryResp, err := client.Post(srv.URL+path+query, "application/x-www-form-urlencoded", nil)
+				if err != nil {
+					t.Fatalf("POST query %s error = %v", path, err)
+				}
+				postQueryBody, _ := io.ReadAll(postQueryResp.Body)
+				postQueryResp.Body.Close()
+				if postQueryResp.StatusCode != http.StatusOK {
+					t.Fatalf("POST query status = %d, want 200", postQueryResp.StatusCode)
+				}
+				assertCORSHeaders(t, postQueryResp.Header)
+				assertEmptyExtensions(t, postQueryBody, isJSON)
+			})
+		}
+	}
+
+	t.Run("disallowed methods return 405 with Allow and CORS without auth", func(t *testing.T) {
+		for _, method := range []string{http.MethodPut, http.MethodDelete} {
+			req, err := http.NewRequest(method, srv.URL+"/rest/getOpenSubsonicExtensions", nil)
+			if err != nil {
+				t.Fatalf("NewRequest error = %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("%s /rest/getOpenSubsonicExtensions error = %v", method, err)
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("%s status = %d, want 405", method, resp.StatusCode)
+			}
+			if allow := resp.Header.Get("Allow"); !strings.Contains(allow, "GET") || !strings.Contains(allow, "POST") {
+				t.Errorf("%s Allow = %q, want GET and POST", method, allow)
+			}
+			assertCORSHeaders(t, resp.Header)
+		}
+	})
+
+	t.Run("malformed POST body returns error 0 with CORS without auth", func(t *testing.T) {
+		resp, err := client.Post(srv.URL+"/rest/getOpenSubsonicExtensions?f=json", "application/x-www-form-urlencoded", strings.NewReader("bad=%ZZ"))
+		if err != nil {
+			t.Fatalf("POST malformed body error = %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		assertCORSHeaders(t, resp.Header)
+		m := decodeJSON(t, body)
+		assertJSONEnvelopeFields(t, m, "failed")
+		errObj, ok := m["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("JSON missing error object: %s", string(body))
+		}
+		if code, ok := errObj["code"].(float64); !ok || code != 0 {
+			t.Errorf("error.code = %v (ok=%v), want 0", errObj["code"], ok)
+		}
+	})
+
+	if calls := failingAuth.calls.Load(); calls != 0 {
+		t.Fatalf("Authenticator calls before /rest/ping = %d, want 0", calls)
+	}
+
+	t.Run("authenticated endpoint on same handler still enforces auth", func(t *testing.T) {
+		resp, err := client.Get(srv.URL + "/rest/ping")
+		if err != nil {
+			t.Fatalf("GET /rest/ping error = %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		env := decodeXML(t, body)
+		assertEnvelopeFields(t, env, "failed")
+		if env.Error == nil || env.Error.Code != 40 {
+			t.Errorf("XML error = %+v, want Code=40", env.Error)
+		}
+		if calls := failingAuth.calls.Load(); calls != 1 {
+			t.Errorf("Authenticator calls after /rest/ping = %d, want 1", calls)
+		}
+	})
+}
+
+func TestTokenInfo(t *testing.T) {
+	scan := &atomicScanStatusProvider{}
+
+	assertTokenInfoOK := func(t *testing.T, body []byte, isJSON bool, wantUsername string) {
+		t.Helper()
+		assertNoCoverArt(t, body)
+		if isJSON {
+			m := decodeJSON(t, body)
+			assertJSONEnvelopeFields(t, m, "ok")
+			ti, ok := m["tokenInfo"].(map[string]any)
+			if !ok {
+				t.Fatalf("JSON missing tokenInfo object: %s", string(body))
+			}
+			if ti["username"] != wantUsername {
+				t.Errorf("JSON tokenInfo.username = %v, want %q", ti["username"], wantUsername)
+			}
+			return
+		}
+		env := decodeXML(t, body)
+		assertEnvelopeFields(t, env, "ok")
+		if env.TokenInfo == nil || env.TokenInfo.Username != wantUsername {
+			t.Errorf("XML TokenInfo = %+v, want Username=%q", env.TokenInfo, wantUsername)
+		}
+		wantTag := `<tokenInfo username="` + wantUsername + `"></tokenInfo>`
+		if !strings.Contains(string(body), wantTag) {
+			t.Errorf("XML = %s, want substring %s", string(body), wantTag)
+		}
+	}
+
+	assertErrorEnvelope := func(t *testing.T, body []byte, isJSON bool, wantCode int, wantMsg string) {
+		t.Helper()
+		if isJSON {
+			m := decodeJSON(t, body)
+			assertJSONEnvelopeFields(t, m, "failed")
+			if _, exists := m["tokenInfo"]; exists {
+				t.Errorf("JSON unexpectedly included tokenInfo on error: %s", string(body))
+			}
+			errObj, ok := m["error"].(map[string]any)
+			if !ok {
+				t.Fatalf("JSON missing error object: %s", string(body))
+			}
+			if code, ok := errObj["code"].(float64); !ok || int(code) != wantCode {
+				t.Errorf("error.code = %v (ok=%v), want %d", errObj["code"], ok, wantCode)
+			}
+			if msg, _ := errObj["message"].(string); msg != wantMsg {
+				t.Errorf("error.message = %q, want %q", msg, wantMsg)
+			}
+			return
+		}
+		env := decodeXML(t, body)
+		assertEnvelopeFields(t, env, "failed")
+		if env.TokenInfo != nil {
+			t.Errorf("XML unexpectedly included TokenInfo on error: %+v", env.TokenInfo)
+		}
+		if env.Error == nil || env.Error.Code != wantCode || env.Error.Message != wantMsg {
+			t.Errorf("XML error = %+v, want Code=%d Message=%q", env.Error, wantCode, wantMsg)
+		}
+	}
+
+	t.Run("API key principal succeeds across routes, methods, and formats", func(t *testing.T) {
+		h := newTestHandler(t, &stubAuthenticator{
+			principal: auth.Principal{Username: "alice", Method: auth.AuthMethodAPIKey},
+		}, scan)
+		srv := httptest.NewServer(h)
+		defer srv.Close()
+		client := srv.Client()
+
+		for _, suffix := range []string{"", ".view"} {
+			path := "/rest/tokenInfo" + suffix
+			for _, format := range []string{"", "json"} {
+				isJSON := format == "json"
+				query := ""
+				if isJSON {
+					query = "?f=json"
+				}
+
+				t.Run("tokenInfo"+suffix+"_"+format, func(t *testing.T) {
+					// GET
+					getResp, err := client.Get(srv.URL + path + query)
+					if err != nil {
+						t.Fatalf("GET %s error = %v", path, err)
+					}
+					getBody, _ := io.ReadAll(getResp.Body)
+					getResp.Body.Close()
+					if getResp.StatusCode != http.StatusOK {
+						t.Fatalf("GET status = %d, want 200", getResp.StatusCode)
+					}
+					assertCORSHeaders(t, getResp.Header)
+					assertTokenInfoOK(t, getBody, isJSON, "alice")
+
+					// HEAD
+					headResp, err := client.Head(srv.URL + path + query)
+					if err != nil {
+						t.Fatalf("HEAD %s error = %v", path, err)
+					}
+					headBody, _ := io.ReadAll(headResp.Body)
+					headResp.Body.Close()
+					if headResp.StatusCode != http.StatusOK {
+						t.Fatalf("HEAD status = %d, want 200", headResp.StatusCode)
+					}
+					assertCORSHeaders(t, headResp.Header)
+					if len(headBody) != 0 {
+						t.Errorf("HEAD body len = %d, want 0", len(headBody))
+					}
+					if got, want := headResp.Header.Get("Content-Length"), strconv.Itoa(len(getBody)); got != want {
+						t.Errorf("HEAD Content-Length = %q, want %q", got, want)
+					}
+
+					// POST form
+					form := url.Values{}
+					if isJSON {
+						form.Set("f", "json")
+					}
+					postFormResp, err := client.PostForm(srv.URL+path, form)
+					if err != nil {
+						t.Fatalf("POST form %s error = %v", path, err)
+					}
+					postFormBody, _ := io.ReadAll(postFormResp.Body)
+					postFormResp.Body.Close()
+					if postFormResp.StatusCode != http.StatusOK {
+						t.Fatalf("POST form status = %d, want 200", postFormResp.StatusCode)
+					}
+					assertCORSHeaders(t, postFormResp.Header)
+					assertTokenInfoOK(t, postFormBody, isJSON, "alice")
+
+					// POST query-only
+					postQueryResp, err := client.Post(srv.URL+path+query, "application/x-www-form-urlencoded", nil)
+					if err != nil {
+						t.Fatalf("POST query %s error = %v", path, err)
+					}
+					postQueryBody, _ := io.ReadAll(postQueryResp.Body)
+					postQueryResp.Body.Close()
+					if postQueryResp.StatusCode != http.StatusOK {
+						t.Fatalf("POST query status = %d, want 200", postQueryResp.StatusCode)
+					}
+					assertCORSHeaders(t, postQueryResp.Header)
+					assertTokenInfoOK(t, postQueryBody, isJSON, "alice")
+				})
+			}
+		}
+	})
+
+	t.Run("non-API-key auth methods return error 42", func(t *testing.T) {
+		methods := []struct {
+			name   string
+			method auth.AuthMethod
+		}{
+			{name: "token", method: auth.AuthMethodToken},
+			{name: "noop", method: auth.AuthMethodNoop},
+			{name: "empty", method: ""},
+		}
+		for _, tc := range methods {
+			t.Run(tc.name, func(t *testing.T) {
+				h := newTestHandler(t, &stubAuthenticator{
+					principal: auth.Principal{Username: "alice", Method: tc.method},
+				}, scan)
+
+				for _, format := range []string{"", "json"} {
+					isJSON := format == "json"
+					target := "/rest/tokenInfo"
+					if isJSON {
+						target += "?f=json"
+					}
+					rec := httptest.NewRecorder()
+					h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+
+					if rec.Code != http.StatusOK {
+						t.Fatalf("status = %d, want 200", rec.Code)
+					}
+					assertCORSHeaders(t, rec.Header())
+					assertErrorEnvelope(t, rec.Body.Bytes(), isJSON, 42, "Provided authentication mechanism not supported")
+				}
+			})
+		}
+	})
+
+	t.Run("auth middleware errors propagate safely", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			err      error
+			wantCode int
+			wantMsg  string
+			secret   string
+		}{
+			{
+				name:     "invalid API key returns 44",
+				err:      &auth.AuthError{Code: auth.ErrCodeInvalidAPIKey},
+				wantCode: 44,
+				wantMsg:  "Invalid API key",
+			},
+			{
+				name:     "wrong credentials returns 40",
+				err:      &auth.AuthError{Code: auth.ErrCodeWrongCredentials},
+				wantCode: 40,
+				wantMsg:  "Wrong username or password",
+			},
+			{
+				name:     "untyped internal error returns 40 without leaking details",
+				err:      errors.New("secret-db-connection-failed"),
+				wantCode: 40,
+				wantMsg:  "Wrong username or password",
+				secret:   "secret-db-connection-failed",
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				h := newTestHandler(t, &stubAuthenticator{err: tc.err}, scan)
+
+				for _, format := range []string{"", "json"} {
+					isJSON := format == "json"
+					target := "/rest/tokenInfo"
+					if isJSON {
+						target += "?f=json"
+					}
+					rec := httptest.NewRecorder()
+					h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+
+					if rec.Code != http.StatusOK {
+						t.Fatalf("status = %d, want 200", rec.Code)
+					}
+					assertCORSHeaders(t, rec.Header())
+					if tc.secret != "" && strings.Contains(rec.Body.String(), tc.secret) {
+						t.Fatalf("response leaked internal error: %s", rec.Body.String())
+					}
+					assertErrorEnvelope(t, rec.Body.Bytes(), isJSON, tc.wantCode, tc.wantMsg)
+				}
+			})
+		}
+	})
+
+	t.Run("disallowed methods return 405 with Allow and CORS", func(t *testing.T) {
+		h := newTestHandler(t, &stubAuthenticator{
+			principal: auth.Principal{Username: "alice", Method: auth.AuthMethodAPIKey},
+		}, scan)
+		srv := httptest.NewServer(h)
+		defer srv.Close()
+		client := srv.Client()
+
+		for _, method := range []string{http.MethodPut, http.MethodDelete} {
+			req, err := http.NewRequest(method, srv.URL+"/rest/tokenInfo", nil)
+			if err != nil {
+				t.Fatalf("NewRequest error = %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("%s /rest/tokenInfo error = %v", method, err)
+			}
+			resp.Body.Close()
+
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				t.Errorf("%s status = %d, want 405", method, resp.StatusCode)
+			}
+			if allow := resp.Header.Get("Allow"); !strings.Contains(allow, "GET") || !strings.Contains(allow, "POST") {
+				t.Errorf("%s Allow = %q, want GET and POST", method, allow)
+			}
+			assertCORSHeaders(t, resp.Header)
+		}
+	})
+}
+
 func TestConcurrentRequests(t *testing.T) {
 	scan := &atomicScanStatusProvider{}
 	h := newTestHandler(t, auth.NoopAuthenticator{}, scan)
@@ -1344,12 +1914,13 @@ func TestConcurrentRequests(t *testing.T) {
 	defer srv.Close()
 
 	const workers = 32
-	const iterations = 10
+	const iterations = 12
 	paths := []string{
 		"/rest/ping",
 		"/rest/ping.view?f=json",
 		"/rest/getLicense",
 		"/rest/getOpenSubsonicExtensions?f=json",
+		"/rest/tokenInfo?f=json",
 		"/rest/getUser?u=listener",
 		"/rest/getScanStatus?f=json",
 		"/rest/getGenres?f=json",
@@ -1393,7 +1964,7 @@ func TestConcurrentRequests(t *testing.T) {
 					resp *http.Response
 					err  error
 				)
-				switch (workerID + i) % 4 {
+				switch workerID % 6 {
 				case 0:
 					resp, err = client.Get(target)
 				case 1:
@@ -1406,6 +1977,10 @@ func TestConcurrentRequests(t *testing.T) {
 					if err == nil {
 						resp, err = client.Do(req)
 					}
+				case 4:
+					resp, err = client.Get(srv.URL + "/healthz")
+				case 5:
+					resp, err = client.Head(srv.URL + "/healthz")
 				}
 				if err != nil {
 					errCh <- err

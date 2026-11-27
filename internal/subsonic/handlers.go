@@ -1,12 +1,26 @@
 package subsonic
 
 import (
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"headunit/internal/auth"
 )
+
+func (h *handler) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Length", strconv.Itoa(len(healthzBody)))
+	w.WriteHeader(http.StatusOK)
+
+	if r != nil && r.Method == http.MethodHead {
+		return
+	}
+	_, _ = io.WriteString(w, healthzBody)
+}
 
 func (h *handler) handlePing(w http.ResponseWriter, r *http.Request) {
 	h.writeOK(w, r, Response{})
@@ -22,6 +36,19 @@ func (h *handler) handleGetOpenSubsonicExtensions(w http.ResponseWriter, r *http
 	exts := []OpenSubsonicExtension{}
 	h.writeOK(w, r, Response{
 		OpenSubsonicExtensions: &exts,
+	})
+}
+
+func (h *handler) handleTokenInfo(w http.ResponseWriter, r *http.Request) {
+	principal := auth.PrincipalFromContext(r.Context())
+	if principal.Method != auth.AuthMethodAPIKey {
+		h.writeError(w, r, auth.ErrCodeUnsupportedAuth, msgUnsupportedAuth)
+		return
+	}
+	h.writeOK(w, r, Response{
+		TokenInfo: &TokenInfo{
+			Username: principal.Username,
+		},
 	})
 }
 
