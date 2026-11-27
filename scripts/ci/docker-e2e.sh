@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Orchestrates the isolated Docker Compose E2E test suite against TestDockerComposeE2E.
-# Env overrides: HOST_PORT (default 127.0.0.1:), PUID (1000), PGID (1000),
-# MUSIC_MOUNT_OPTS (ro), HEALTH_TIMEOUT (90), SCAN_TIMEOUT (30s).
+# Orchestrates the isolated Docker Compose E2E test suite (./e2e).
+# Env overrides: HOST_PORT (default 127.0.0.1:, trailing colon allocates an ephemeral
+# loopback port via 127.0.0.1::4533; e.g., 127.0.0.1:14533 for a fixed port),
+# PUID (1000), PGID (1000), MUSIC_MOUNT_OPTS (ro),
+# HEALTH_TIMEOUT (default 90, positive integer in seconds),
+# SCAN_TIMEOUT (default 30s, Go duration).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -114,6 +117,11 @@ verify_container_runtime() {
 }
 
 main() {
+  if [[ ! "$HEALTH_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: HEALTH_TIMEOUT must be a positive integer in seconds (got: '${HEALTH_TIMEOUT}')" >&2
+    return 1
+  fi
+
   TMP_DIR="$(mktemp -d)"
   MUSIC_DIR="${TMP_DIR}/music"
   mkdir -p "$MUSIC_DIR"
@@ -138,22 +146,34 @@ main() {
 
   local port_output=""
   local port_mapping=""
+  local mapped_host=""
   local mapped_port=""
   port_output="$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" port headunit 4533)"
   port_mapping="${port_output%%$'\n'*}"
+  mapped_host="${port_mapping%:*}"
   mapped_port="${port_mapping##*:}"
-  if [[ "$port_mapping" != *:* || ! "$mapped_port" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ "$port_mapping" != *:* || -z "$mapped_host" || ! "$mapped_port" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: failed to resolve published host port for headunit:4533 (got: '${port_output}')" >&2
     return 1
   fi
-  local base_url="http://127.0.0.1:${mapped_port}"
+  case "$mapped_host" in
+    0.0.0.0|::|"[::]")
+      mapped_host="127.0.0.1"
+      ;;
+    *:*)
+      if [[ "$mapped_host" != \[?*\] ]]; then
+        mapped_host="[${mapped_host}]"
+      fi
+      ;;
+  esac
+  local base_url="http://${mapped_host}:${mapped_port}"
 
   (
     cd "$REPO_ROOT"
     HEADUNIT_E2E_URL="$base_url" \
     HEADUNIT_E2E_MUSIC_DIR="$MUSIC_DIR" \
     HEADUNIT_E2E_SCAN_TIMEOUT="$SCAN_TIMEOUT" \
-      go test -tags=e2e -v -count=1 -run '^TestDockerComposeE2E$' ./cmd/headunit
+      go test -tags=e2e -v -count=1 ./e2e
   )
 }
 

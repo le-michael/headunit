@@ -79,7 +79,7 @@ jobs:
           CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/headunit" ./cmd/headunit
           test -x "${RUNNER_TEMP}/headunit"
       - name: Compile Go E2E test suite
-        run: go test -tags=e2e -c -o /dev/null ./cmd/headunit
+        run: go test -tags=e2e -c -o /dev/null ./e2e
       - name: Build Docker image
         run: docker build -t headunit:ci .
 

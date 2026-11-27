@@ -8,7 +8,7 @@ Run from the repository root once the Go module and Docker setup are in place:
 
 - Build static binary: `CGO_ENABLED=0 go build ./cmd/headunit`
 - Run full test suite: `go test -race ./...`
-- Run Docker Compose E2E suite: `./scripts/ci/docker-e2e.sh`
+- Run Docker Compose E2E suite: `./scripts/ci/docker-e2e.sh` (runs `go test -tags=e2e -v -count=1 ./e2e`)
 - Run a single test: `go test -race -run TestName ./internal/<pkg>`
 - Static analysis: `go vet ./...` and `go vet -tags=e2e ./...`
 - Format code: `gofmt -w .`
