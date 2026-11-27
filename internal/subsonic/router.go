@@ -90,14 +90,17 @@ func NewHandler(deps Dependencies) (http.Handler, error) {
 		logger:   logger,
 	}
 
-	mux := http.NewServeMux()
-	routes := []struct {
+	restMux := http.NewServeMux()
+	// OpenSubsonic requires getOpenSubsonicExtensions to be accessible without authentication.
+	registerHandler(restMux, "getOpenSubsonicExtensions", http.HandlerFunc(h.handleGetOpenSubsonicExtensions))
+
+	authenticatedRoutes := []struct {
 		method string
 		fn     http.HandlerFunc
 	}{
 		{method: "ping", fn: h.handlePing},
 		{method: "getLicense", fn: h.handleGetLicense},
-		{method: "getOpenSubsonicExtensions", fn: h.handleGetOpenSubsonicExtensions},
+		{method: "tokenInfo", fn: h.handleTokenInfo},
 		{method: "getUser", fn: h.handleGetUser},
 		{method: "getScanStatus", fn: h.handleGetScanStatus},
 		{method: "getMusicFolders", fn: h.handleGetMusicFolders},
@@ -115,17 +118,22 @@ func NewHandler(deps Dependencies) (http.Handler, error) {
 		{method: "scrobble", fn: h.handleScrobble},
 	}
 
-	for _, rt := range routes {
-		registerEndpoint(mux, rt.method, rt.fn)
+	authMW := auth.Middleware(deps.Auth, h.writeError)
+	for _, rt := range authenticatedRoutes {
+		registerHandler(restMux, rt.method, authMW(http.HandlerFunc(rt.fn)))
 	}
 
-	return h.corsMiddleware(h.parseFormMiddleware(auth.Middleware(deps.Auth, h.writeError)(mux))), nil
+	rootMux := http.NewServeMux()
+	rootMux.HandleFunc("GET /healthz", h.handleHealthz)
+	rootMux.Handle("/rest/", h.corsMiddleware(h.parseFormMiddleware(restMux)))
+
+	return rootMux, nil
 }
 
-func registerEndpoint(mux *http.ServeMux, method string, fn http.HandlerFunc) {
+func registerHandler(mux *http.ServeMux, method string, h http.Handler) {
 	for _, path := range []string{"/rest/" + method, "/rest/" + method + ".view"} {
-		mux.HandleFunc("GET "+path, fn)
-		mux.HandleFunc("POST "+path, fn)
+		mux.Handle("GET "+path, h)
+		mux.Handle("POST "+path, h)
 	}
 }
 
