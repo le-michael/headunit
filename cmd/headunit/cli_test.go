@@ -27,30 +27,30 @@ import (
 func TestParseServeArgsAndCLIDispatch(t *testing.T) {
 	t.Run("parseServeArgs", func(t *testing.T) {
 		tests := []struct {
-			name       string
-			args       []string
-			wantErr    error
-			wantErrSub string
-			wantStderr string
-			exactErrIs bool
+			name        string
+			args        []string
+			wantErr     error
+			wantErrSub  string
+			wantStderrs []string
+			exactErrIs  bool
 		}{
 			{
 				name: "empty args",
 				args: nil,
 			},
 			{
-				name:       "help flag",
-				args:       []string{"--help"},
-				wantErr:    flag.ErrHelp,
-				exactErrIs: true,
-				wantStderr: "Usage: headunit serve",
+				name:        "help flag",
+				args:        []string{"--help"},
+				wantErr:     flag.ErrHelp,
+				exactErrIs:  true,
+				wantStderrs: []string{"Usage: headunit serve", "UPLOADS_ENABLED", "UPLOAD_MAX_FILE_BYTES"},
 			},
 			{
-				name:       "short help flag",
-				args:       []string{"-h"},
-				wantErr:    flag.ErrHelp,
-				exactErrIs: true,
-				wantStderr: "Usage: headunit serve",
+				name:        "short help flag",
+				args:        []string{"-h"},
+				wantErr:     flag.ErrHelp,
+				exactErrIs:  true,
+				wantStderrs: []string{"Usage: headunit serve", "UPLOADS_ENABLED", "UPLOAD_MAX_FILE_BYTES"},
 			},
 			{
 				name:       "unknown flag",
@@ -80,9 +80,12 @@ func TestParseServeArgsAndCLIDispatch(t *testing.T) {
 					t.Fatalf("parseServeArgs(%v) unexpected error: %v", tc.args, err)
 				}
 
-				if tc.wantStderr != "" {
-					if got := stderr.String(); !strings.Contains(got, tc.wantStderr) {
-						t.Errorf("stderr = %q, want substring %q", got, tc.wantStderr)
+				if len(tc.wantStderrs) > 0 {
+					got := stderr.String()
+					for _, wantSub := range tc.wantStderrs {
+						if !strings.Contains(got, wantSub) {
+							t.Errorf("stderr = %q, want substring %q", got, wantSub)
+						}
 					}
 				} else if got := stderr.String(); got != "" {
 					t.Errorf("stderr = %q, want empty", got)

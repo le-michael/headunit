@@ -21,14 +21,16 @@ import (
 	"headunit/internal/store"
 	"headunit/internal/stream"
 	"headunit/internal/subsonic"
+	"headunit/internal/upload"
 )
 
 const (
-	defaultReadHeaderTimeout = 10 * time.Second
-	defaultIdleTimeout       = 120 * time.Second
-	defaultShutdownTimeout   = 10 * time.Second
-	dbFilename               = "headunit.db"
-	uploadsDirname           = "uploads"
+	defaultReadHeaderTimeout  = 10 * time.Second
+	defaultIdleTimeout        = 120 * time.Second
+	defaultShutdownTimeout    = 10 * time.Second
+	defaultUploadMaxFileBytes = int64(256 << 20)
+	dbFilename                = "headunit.db"
+	uploadsDirname            = "uploads"
 )
 
 type server struct {
@@ -37,6 +39,7 @@ type server struct {
 	store           *store.Store
 	streamer        *stream.DirectStreamer
 	scanner         *scanner.Service
+	uploadHandler   *upload.Handler
 	httpSrv         *http.Server
 	shutdownTimeout time.Duration
 }
@@ -161,21 +164,43 @@ func newServer(ctx context.Context, cfg config.Config, logger *slog.Logger) (*se
 	}
 	srv.scanner = scanSvc
 
-	handler, err := subsonic.NewHandler(subsonic.Dependencies{
-		Auth:     authenticator,
-		Scanner:  scanSvc,
-		Store:    st,
-		Users:    st,
-		Streamer: streamer,
-		Logger:   logger,
+	maxFileBytes := cfg.UploadMaxFileBytes
+	if maxFileBytes == 0 {
+		maxFileBytes = defaultUploadMaxFileBytes
+	}
+	uploadHandler, err := upload.NewHandler(upload.Dependencies{
+		Auth:           authenticator,
+		Ingester:       scanSvc,
+		UploadsDir:     uploadsDir,
+		UploadsEnabled: cfg.UploadsEnabled,
+		MaxFileBytes:   maxFileBytes,
+		Logger:         logger,
+	})
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("init upload handler: %w", err), srv.closeResources())
+	}
+	srv.uploadHandler = uploadHandler
+
+	subsonicHandler, err := subsonic.NewHandler(subsonic.Dependencies{
+		Auth:           authenticator,
+		Scanner:        scanSvc,
+		Store:          st,
+		Users:          st,
+		Streamer:       streamer,
+		UploadsEnabled: cfg.UploadsEnabled,
+		Logger:         logger,
 	})
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("init http handler: %w", err), srv.closeResources())
 	}
 
+	topMux := http.NewServeMux()
+	topMux.Handle("/api/v1/upload", uploadHandler)
+	topMux.Handle("/", subsonicHandler)
+
 	srv.httpSrv = &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           handler,
+		Handler:           topMux,
 		ReadHeaderTimeout: defaultReadHeaderTimeout,
 		IdleTimeout:       defaultIdleTimeout,
 		// WriteTimeout is intentionally left at zero so long lossless audio
@@ -259,9 +284,14 @@ func (s *server) closeResources() error {
 	if s == nil {
 		return nil
 	}
-	// Close streamer before store so confined root handles are released
-	// before SQLite checkpoints WAL state and closes its pools.
-	var streamerErr, storeErr error
+	// Close upload handler and streamer before store so confined root handles
+	// are released before SQLite checkpoints WAL state and closes its pools.
+	var uploadErr, streamerErr, storeErr error
+	if s.uploadHandler != nil {
+		if err := s.uploadHandler.Close(); err != nil {
+			uploadErr = fmt.Errorf("close upload handler: %w", err)
+		}
+	}
 	if s.streamer != nil {
 		if err := s.streamer.Close(); err != nil {
 			streamerErr = fmt.Errorf("close streamer: %w", err)
@@ -272,7 +302,7 @@ func (s *server) closeResources() error {
 			storeErr = fmt.Errorf("close store: %w", err)
 		}
 	}
-	return errors.Join(streamerErr, storeErr)
+	return errors.Join(uploadErr, streamerErr, storeErr)
 }
 
 func unexpectedServeError(err error) error {

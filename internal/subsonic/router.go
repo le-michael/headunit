@@ -61,17 +61,22 @@ type Dependencies struct {
 	// Streamer serves audio playback for /rest/stream. Required.
 	Streamer stream.Streamer
 
+	// UploadsEnabled reports whether HTTP media uploads are enabled for admin users.
+	// When true, getUser sets uploadRole=true for admin users.
+	UploadsEnabled bool
+
 	// Logger records unexpected internal serialization and backend errors. Optional;
 	// nil defaults to slog.New(slog.DiscardHandler).
 	Logger *slog.Logger
 }
 
 type handler struct {
-	scanner  ScanStatusProvider
-	store    LibraryStore
-	users    UserStore
-	streamer stream.Streamer
-	logger   *slog.Logger
+	scanner        ScanStatusProvider
+	store          LibraryStore
+	users          UserStore
+	streamer       stream.Streamer
+	uploadsEnabled bool
+	logger         *slog.Logger
 }
 
 // NewHandler constructs the Headunit OpenSubsonic v1.16.1 HTTP handler.
@@ -99,11 +104,12 @@ func NewHandler(deps Dependencies) (http.Handler, error) {
 	}
 
 	h := &handler{
-		scanner:  deps.Scanner,
-		store:    deps.Store,
-		users:    deps.Users,
-		streamer: deps.Streamer,
-		logger:   logger,
+		scanner:        deps.Scanner,
+		store:          deps.Store,
+		users:          deps.Users,
+		streamer:       deps.Streamer,
+		uploadsEnabled: deps.UploadsEnabled,
+		logger:         logger,
 	}
 
 	restMux := http.NewServeMux()

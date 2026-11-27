@@ -678,7 +678,8 @@ func printServeUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage: headunit serve
 
 Start the OpenSubsonic HTTP server. Configuration is read from environment
-variables (PORT, MUSIC_DIR, DATA_DIR, SCAN_INTERVAL, AUTH_SECRET_KEY).`)
+variables (PORT, MUSIC_DIR, DATA_DIR, SCAN_INTERVAL, AUTH_SECRET_KEY,
+UPLOADS_ENABLED, UPLOAD_MAX_FILE_BYTES).`)
 }
 
 func printUserUsage(w io.Writer) {

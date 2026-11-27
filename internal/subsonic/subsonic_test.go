@@ -199,20 +199,26 @@ type jsonEnvelope struct {
 	SubsonicResponse map[string]any `json:"subsonic-response"`
 }
 
-func newTestHandlerWithUsers(t *testing.T, authImpl auth.Authenticator, scanImpl subsonic.ScanStatusProvider, users subsonic.UserStore, logger *slog.Logger) http.Handler {
+func newTestHandlerWithUsersAndUploads(t *testing.T, authImpl auth.Authenticator, scanImpl subsonic.ScanStatusProvider, users subsonic.UserStore, uploadsEnabled bool, logger *slog.Logger) http.Handler {
 	t.Helper()
 	h, err := subsonic.NewHandler(subsonic.Dependencies{
-		Auth:     authImpl,
-		Scanner:  scanImpl,
-		Store:    noopLibraryStore{},
-		Users:    users,
-		Streamer: noopStreamer{},
-		Logger:   logger,
+		Auth:           authImpl,
+		Scanner:        scanImpl,
+		Store:          noopLibraryStore{},
+		Users:          users,
+		Streamer:       noopStreamer{},
+		UploadsEnabled: uploadsEnabled,
+		Logger:         logger,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler() error = %v", err)
 	}
 	return h
+}
+
+func newTestHandlerWithUsers(t *testing.T, authImpl auth.Authenticator, scanImpl subsonic.ScanStatusProvider, users subsonic.UserStore, logger *slog.Logger) http.Handler {
+	t.Helper()
+	return newTestHandlerWithUsersAndUploads(t, authImpl, scanImpl, users, false, logger)
 }
 
 func newTestHandler(t *testing.T, authImpl auth.Authenticator, scanImpl subsonic.ScanStatusProvider) http.Handler {
@@ -1166,13 +1172,18 @@ func assertAPIKeyAuthenticationExtension(t *testing.T, body []byte, isJSON bool)
 
 func assertUserResponse(t *testing.T, body []byte, isJSON bool, wantUsername string, wantAdmin bool) {
 	t.Helper()
+	assertUserResponseWithUploadRole(t, body, isJSON, wantUsername, wantAdmin, false)
+}
+
+func assertUserResponseWithUploadRole(t *testing.T, body []byte, isJSON bool, wantUsername string, wantAdmin, wantUpload bool) {
+	t.Helper()
 	assertNoCoverArt(t, body)
 	wantBools := map[string]bool{
 		"scrobblingEnabled":   false,
 		"adminRole":           wantAdmin,
 		"settingsRole":        false,
 		"downloadRole":        false,
-		"uploadRole":          false,
+		"uploadRole":          wantUpload,
 		"playlistRole":        false,
 		"coverArtRole":        false,
 		"commentRole":         false,
@@ -1218,8 +1229,8 @@ func assertUserResponse(t *testing.T, body []byte, isJSON bool, wantUsername str
 	if env.User == nil {
 		t.Fatalf("XML User = nil")
 	}
-	if env.User.Username != wantUsername || env.User.AdminRole != wantAdmin || !env.User.StreamRole || env.User.DownloadRole || !slices.Equal(env.User.Folder, []int{1}) {
-		t.Errorf("XML User = %+v, want Username=%q AdminRole=%v StreamRole=true Folder=[1]", env.User, wantUsername, wantAdmin)
+	if env.User.Username != wantUsername || env.User.AdminRole != wantAdmin || env.User.UploadRole != wantUpload || !env.User.StreamRole || env.User.DownloadRole || !slices.Equal(env.User.Folder, []int{1}) {
+		t.Errorf("XML User = %+v, want Username=%q AdminRole=%v UploadRole=%v StreamRole=true Folder=[1]", env.User, wantUsername, wantAdmin, wantUpload)
 	}
 }
 
@@ -2246,6 +2257,99 @@ func TestGetUser(t *testing.T) {
 				if tc.secretLog != "" && !strings.Contains(logBuf.String(), tc.secretLog) {
 					t.Errorf("expected slog output to contain %q, got %q", tc.secretLog, logBuf.String())
 				}
+			})
+		}
+	}
+}
+
+func TestGetUserUploadRole(t *testing.T) {
+	scan := &atomicScanStatusProvider{}
+
+	baseUsers := func() map[string]*store.User {
+		return map[string]*store.User{
+			"alice": {ID: "usr_alice", Username: "Alice", IsAdmin: false},
+			"admin": {ID: "usr_admin", Username: "Admin", IsAdmin: true},
+		}
+	}
+
+	cases := []struct {
+		name           string
+		principal      auth.Principal
+		uploadsEnabled bool
+		query          string
+		wantUsername   string
+		wantAdmin      bool
+		wantUpload     bool
+	}{
+		{
+			name:           "admin with uploads enabled",
+			principal:      auth.Principal{Username: "admin", IsAdmin: true},
+			uploadsEnabled: true,
+			wantUsername:   "Admin",
+			wantAdmin:      true,
+			wantUpload:     true,
+		},
+		{
+			name:           "non-admin with uploads enabled",
+			principal:      auth.Principal{Username: "alice", IsAdmin: false},
+			uploadsEnabled: true,
+			wantUsername:   "Alice",
+			wantAdmin:      false,
+			wantUpload:     false,
+		},
+		{
+			name:           "admin with uploads disabled",
+			principal:      auth.Principal{Username: "admin", IsAdmin: true},
+			uploadsEnabled: false,
+			wantUsername:   "Admin",
+			wantAdmin:      true,
+			wantUpload:     false,
+		},
+		{
+			name:           "non-admin with uploads disabled",
+			principal:      auth.Principal{Username: "alice", IsAdmin: false},
+			uploadsEnabled: false,
+			wantUsername:   "Alice",
+			wantAdmin:      false,
+			wantUpload:     false,
+		},
+		{
+			name:           "admin querying non-admin with uploads enabled",
+			principal:      auth.Principal{Username: "admin", IsAdmin: true},
+			uploadsEnabled: true,
+			query:          "username=alice",
+			wantUsername:   "Alice",
+			wantAdmin:      false,
+			wantUpload:     false,
+		},
+	}
+
+	for _, tc := range cases {
+		for _, format := range []string{"xml", "json"} {
+			isJSON := format == "json"
+			t.Run(tc.name+"_"+format, func(t *testing.T) {
+				userStore := &stubUserStore{users: baseUsers()}
+				h := newTestHandlerWithUsersAndUploads(t, &stubAuthenticator{principal: tc.principal}, scan, userStore, tc.uploadsEnabled, nil)
+
+				target := "/rest/getUser"
+				q := tc.query
+				if isJSON {
+					if q != "" {
+						q += "&f=json"
+					} else {
+						q = "f=json"
+					}
+				}
+				if q != "" {
+					target += "?" + q
+				}
+
+				res, body := execSubsonicRequest(t, h, http.MethodGet, target, "")
+				if res.StatusCode != http.StatusOK {
+					t.Fatalf("status = %d, want 200", res.StatusCode)
+				}
+				assertCORSHeaders(t, res.Header)
+				assertUserResponseWithUploadRole(t, body, isJSON, tc.wantUsername, tc.wantAdmin, tc.wantUpload)
 			})
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -951,6 +953,29 @@ func TestStartupAndServeFailureCleanup(t *testing.T) {
 		assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 0)
 	})
 
+	t.Run("negative upload max file bytes", func(t *testing.T) {
+		dataDir := t.TempDir()
+		cfg := config.Config{
+			Port:               "4533",
+			MusicDir:           t.TempDir(),
+			DataDir:            dataDir,
+			ScanInterval:       0,
+			UploadsEnabled:     true,
+			UploadMaxFileBytes: -1,
+		}
+
+		srv, err := newServer(context.Background(), cfg, nil)
+		if err == nil {
+			_ = srv.closeResources()
+			t.Fatalf("newServer() error = nil, want error for negative UploadMaxFileBytes")
+		}
+		if srv != nil {
+			t.Fatalf("newServer() server = %+v, want nil", srv)
+		}
+
+		assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 0)
+	})
+
 	t.Run("corrupt auth key", func(t *testing.T) {
 		dataDir := t.TempDir()
 		secretMaterial := "not-valid-hex-secret-material"
@@ -1665,6 +1690,596 @@ func TestMultiRootServer_UploadsDisabledStillScansWatchesAndStreams(t *testing.T
 	assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 3)
 }
 
+type uploadSuccessPayload struct {
+	Status string `json:"status"`
+	Track  struct {
+		ID     string `json:"id"`
+		Path   string `json:"path"`
+		Size   int64  `json:"size"`
+		Title  string `json:"title"`
+		Artist string `json:"artist"`
+		Album  string `json:"album"`
+	} `json:"track"`
+}
+
+type uploadErrorPayload struct {
+	Error struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func startTestServer(t *testing.T, cfg config.Config) (*server, string, func(time.Duration) (error, bool)) {
+	t.Helper()
+	srv, err := newServer(context.Background(), cfg, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("newServer() unexpected error: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = srv.closeResources()
+		t.Fatalf("net.Listen() unexpected error: %v", err)
+	}
+	baseURL := "http://" + ln.Addr().String()
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- srv.serve(runCtx, ln)
+	}()
+
+	var (
+		waitOnce     sync.Once
+		waitServeErr error
+		waitTimedOut bool
+	)
+	stopAndWait := func(timeout time.Duration) (error, bool) {
+		runCancel()
+		waitOnce.Do(func() {
+			select {
+			case waitServeErr = <-serveErrCh:
+			case <-time.After(timeout):
+				waitTimedOut = true
+			}
+		})
+		return waitServeErr, waitTimedOut
+	}
+	t.Cleanup(func() {
+		err, timedOut := stopAndWait(10 * time.Second)
+		if timedOut {
+			t.Errorf("cleanup: timed out waiting for server.serve to exit")
+			return
+		}
+		if err != nil {
+			t.Errorf("cleanup: server.serve returned unexpected error: %v", err)
+		}
+	})
+	return srv, baseURL, stopAndWait
+}
+
+func TestFullServerUploadAPI(t *testing.T) {
+	musicDir := t.TempDir()
+	dataDir := t.TempDir()
+	uploadsDir := filepath.Join(dataDir, uploadsDirname)
+
+	t.Setenv("DATA_DIR", dataDir)
+	t.Setenv("AUTH_SECRET_KEY", "")
+
+	const (
+		alicePass = "upload-alice-secret-1!"
+		bobPass   = "upload-bob-secret-2@"
+	)
+
+	srv1, baseURL, stopSrv1 := startTestServer(t, config.Config{
+		Port:           "4533",
+		MusicDir:       musicDir,
+		DataDir:        dataDir,
+		ScanInterval:   0,
+		UploadsEnabled: true,
+		// UploadMaxFileBytes intentionally left 0 to verify default 256 MiB wiring.
+	})
+
+	var stdout, stderr bytes.Buffer
+	if err := runCLI(
+		context.Background(),
+		[]string{"user", "create", "--username", "alice", "--admin", "--password-stdin"},
+		strings.NewReader(alicePass+"\n"),
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("runCLI(user create alice) error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := runCLI(
+		context.Background(),
+		[]string{"user", "create", "--username", "bob", "--password-stdin"},
+		strings.NewReader(bobPass+"\n"),
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("runCLI(user create bob) error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	createKey := func(username, name string) string {
+		stdout.Reset()
+		stderr.Reset()
+		if err := runCLI(
+			context.Background(),
+			[]string{"apikey", "create", "--username", username, "--name", name},
+			nil,
+			&stdout,
+			&stderr,
+		); err != nil {
+			t.Fatalf("runCLI(apikey create %s) error: %v (stderr=%s)", username, err, stderr.String())
+		}
+		parsed := parseAPIKeyCreateOutput(t, stdout.String())
+		if parsed["api_key"] == "" {
+			t.Fatalf("apikey create %s returned empty key", username)
+		}
+		return parsed["api_key"]
+	}
+	aliceAPIKey := createKey("alice", "admin-upload")
+	bobAPIKey := createKey("bob", "nonadmin-upload")
+
+	aliceAuth := func(salt string) url.Values {
+		return saltedMD5Params("alice", alicePass, salt)
+	}
+	bobAuth := func(salt string) url.Values {
+		return saltedMD5Params("bob", bobPass, salt)
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	t.Cleanup(client.CloseIdleConnections)
+
+	pollScanStatus(t, client, baseURL, aliceAuth, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
+		return !s.Scanning && s.Count == 0 && s.LastScan != ""
+	})
+
+	// Verify getUser.uploadRole when UPLOADS_ENABLED=true (XML & JSON).
+	assertGetUserUploadRole(t, client, baseURL, apiKeyParams(aliceAPIKey), "alice", true, true)
+	assertGetUserUploadRole(t, client, baseURL, apiKeyParams(bobAPIKey), "bob", false, false)
+
+	// Verify GET /api/v1/upload returns 405 JSON + Allow: POST (not 404 from /).
+	getResp, getBody := doHTTPRequest(t, client, http.MethodGet, baseURL+"/api/v1/upload", nil, nil)
+	if got, want := getResp.StatusCode, http.StatusMethodNotAllowed; got != want {
+		t.Fatalf("GET /api/v1/upload status = %d, want %d (body=%s)", got, want, string(getBody))
+	}
+	if got, want := getResp.Header.Get("Allow"), http.MethodPost; got != want {
+		t.Errorf("GET /api/v1/upload Allow = %q, want %q", got, want)
+	}
+	getErr := decodeUploadError(t, getResp, getBody)
+	if got, want := getErr.Error.Code, "method_not_allowed"; got != want {
+		t.Errorf("GET /api/v1/upload error.code = %q, want %q", got, want)
+	}
+
+	// Build two > 1 MiB valid tagged FLAC fixtures and one > 1 MiB second track.
+	const largePayloadSize = (1 << 20) + 16*1024
+	v1Bytes := buildLargeFLAC(t, largePayloadSize, 0x00, map[string][]string{
+		taglib.Title:       {"Large Upload v1"},
+		taglib.AlbumArtist: {"Upload Band"},
+		taglib.Artist:      {"Upload Band"},
+		taglib.Album:       {"Studio Tape"},
+		taglib.TrackNumber: {"1"},
+	})
+	v2Bytes := buildLargeFLAC(t, largePayloadSize+4096, 0xAA, map[string][]string{
+		taglib.Title:       {"Large Upload v2"},
+		taglib.AlbumArtist: {"Upload Band"},
+		taglib.Artist:      {"Upload Band"},
+		taglib.Album:       {"Studio Tape"},
+		taglib.TrackNumber: {"1"},
+	})
+	if len(v1Bytes) <= 1<<20 || len(v2Bytes) <= 1<<20 {
+		t.Fatalf("expected > 1 MiB FLAC fixtures, got v1=%d v2=%d", len(v1Bytes), len(v2Bytes))
+	}
+	if bytes.Equal(v1Bytes[:1024], v2Bytes[:1024]) {
+		t.Fatalf("expected v1 and v2 first 1024 bytes to differ for Range overwrite verification")
+	}
+
+	track2Bytes := buildLargeFLAC(t, largePayloadSize, 0x55, map[string][]string{
+		taglib.Title:       {"Large Upload Two"},
+		taglib.AlbumArtist: {"Upload Band"},
+		taglib.Artist:      {"Upload Band"},
+		taglib.Album:       {"Studio Tape"},
+		taglib.TrackNumber: {"2"},
+	})
+
+	// Unauthenticated POST -> 401 JSON.
+	unauthResp, unauthBody := doUploadRequest(t, client, baseURL+"/api/v1/upload?path="+url.QueryEscape("Studio/Alpha/01 - Large.flac"), "file", "01.flac", v1Bytes)
+	if got, want := unauthResp.StatusCode, http.StatusUnauthorized; got != want {
+		t.Fatalf("unauthenticated upload status = %d, want %d (body=%s)", got, want, string(unauthBody))
+	}
+	unauthErr := decodeUploadError(t, unauthResp, unauthBody)
+	if got, want := unauthErr.Error.Code, "unauthorized"; got != want {
+		t.Errorf("unauthenticated error.code = %q, want %q", got, want)
+	}
+
+	// Non-admin POST (apiKey & u+t+s) -> 403 JSON.
+	for name, params := range map[string]url.Values{
+		"bob-apikey": apiKeyParams(bobAPIKey),
+		"bob-token":  bobAuth("bob-upload-403"),
+	} {
+		params.Set("path", "Studio/Alpha/01 - Large.flac")
+		resp, body := doUploadRequest(t, client, withQueryParams(baseURL+"/api/v1/upload", params), "file", "01.flac", v1Bytes)
+		if got, want := resp.StatusCode, http.StatusForbidden; got != want {
+			t.Fatalf("%s upload status = %d, want %d (body=%s)", name, got, want, string(body))
+		}
+		errPayload := decodeUploadError(t, resp, body)
+		if got, want := errPayload.Error.Code, "forbidden"; got != want {
+			t.Errorf("%s error.code = %q, want %q", name, got, want)
+		}
+	}
+
+	// Corrupt audio upload by admin -> 422 JSON with no staged temp leftovers.
+	corruptParams := apiKeyParams(aliceAPIKey)
+	corruptParams.Set("path", "Studio/Alpha/corrupt.flac")
+	corruptResp, corruptBody := doUploadRequest(t, client, withQueryParams(baseURL+"/api/v1/upload", corruptParams), "file", "corrupt.flac", []byte("not valid audio payload"))
+	if got, want := corruptResp.StatusCode, http.StatusUnprocessableEntity; got != want {
+		t.Fatalf("corrupt upload status = %d, want %d (body=%s)", got, want, string(corruptBody))
+	}
+	corruptErr := decodeUploadError(t, corruptResp, corruptBody)
+	if got, want := corruptErr.Error.Code, "invalid_audio"; got != want {
+		t.Errorf("corrupt upload error.code = %q, want %q", got, want)
+	}
+	assertZeroUploadTempFiles(t, uploadsDir)
+
+	// Admin > 1 MiB upload via apiKey -> 201 Created + immediate Subsonic visibility + stream 200/206.
+	const relTrack1 = "Studio/Alpha/01 - Large.flac"
+	up1Params := apiKeyParams(aliceAPIKey)
+	up1Params.Set("path", relTrack1)
+	up1Resp, up1Body := doUploadRequest(t, client, withQueryParams(baseURL+"/api/v1/upload", up1Params), "file", "01.flac", v1Bytes)
+	if got, want := up1Resp.StatusCode, http.StatusCreated; got != want {
+		t.Fatalf("admin apiKey upload status = %d, want %d (body=%s)", got, want, string(up1Body))
+	}
+	up1 := decodeUploadSuccess(t, up1Resp, up1Body)
+	if up1.Status != "created" {
+		t.Errorf("up1.Status = %q, want %q", up1.Status, "created")
+	}
+	if up1.Track.ID == "" {
+		t.Fatalf("up1.Track.ID is empty")
+	}
+	if up1.Track.Path != "uploads/"+relTrack1 || up1.Track.Size != int64(len(v1Bytes)) {
+		t.Errorf("up1.Track = %+v, want path=%q size=%d", up1.Track, "uploads/"+relTrack1, len(v1Bytes))
+	}
+	if up1.Track.Title != "Large Upload v1" || up1.Track.Artist != "Upload Band" || up1.Track.Album != "Studio Tape" {
+		t.Errorf("up1.Track metadata = %+v, want Large Upload v1 / Upload Band / Studio Tape", up1.Track)
+	}
+
+	// Immediate getScanStatus, search3, getAlbum, and stream (200 + Range 206).
+	scanEnv1, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getScanStatus?f=json", apiKeyParams(aliceAPIKey)))
+	assertJSONResponseEnvelope(t, scanEnv1, "ok")
+	if scanEnv1.ScanStatus == nil || scanEnv1.ScanStatus.Scanning || scanEnv1.ScanStatus.Count != 1 {
+		t.Fatalf("immediate getScanStatus after upload 1 = %+v, want scanning=false count=1", scanEnv1.ScanStatus)
+	}
+
+	search1, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/search3?f=json&query=Large", apiKeyParams(bobAPIKey)))
+	assertJSONResponseEnvelope(t, search1, "ok")
+	if search1.SearchResult3 == nil {
+		t.Fatalf("search3 missing searchResult3")
+	}
+	song1, ok := findSongByPath(search1.SearchResult3.Song, "uploads/"+relTrack1)
+	if !ok || song1.ID != up1.Track.ID {
+		t.Fatalf("search3 song1 = %+v (found=%v), want id=%q path=%q", song1, ok, up1.Track.ID, "uploads/"+relTrack1)
+	}
+
+	album1, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getAlbum?f=json&id="+url.QueryEscape(song1.AlbumID), apiKeyParams(bobAPIKey)))
+	assertJSONResponseEnvelope(t, album1, "ok")
+	if album1.Album == nil || album1.Album.SongCount != 1 || len(album1.Album.Song) != 1 || album1.Album.Song[0].ID != up1.Track.ID {
+		t.Fatalf("getAlbum after upload 1 = %+v, want 1 song with id=%q", album1.Album, up1.Track.ID)
+	}
+
+	assertStreamBytesAndRange206(t, client, baseURL, aliceAuth("stream-v1"), up1.Track.ID, v1Bytes)
+
+	// Admin > 1 MiB upload via u+t+s -> 201 Created + immediate getAlbum/getScanStatus/stream.
+	const relTrack2 = "Studio/Alpha/02 - Second Large.flac"
+	up2Params := aliceAuth("upload-track-2")
+	up2Params.Set("path", relTrack2)
+	up2Resp, up2Body := doUploadRequest(t, client, withQueryParams(baseURL+"/api/v1/upload", up2Params), "file", "02.flac", track2Bytes)
+	if got, want := up2Resp.StatusCode, http.StatusCreated; got != want {
+		t.Fatalf("admin u+t+s upload status = %d, want %d (body=%s)", got, want, string(up2Body))
+	}
+	up2 := decodeUploadSuccess(t, up2Resp, up2Body)
+	if up2.Status != "created" || up2.Track.Path != "uploads/"+relTrack2 {
+		t.Errorf("up2 = %+v, want status=created path=%q", up2, "uploads/"+relTrack2)
+	}
+
+	scanEnv2, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getScanStatus?f=json", aliceAuth("scan-2")))
+	assertJSONResponseEnvelope(t, scanEnv2, "ok")
+	if scanEnv2.ScanStatus == nil || scanEnv2.ScanStatus.Count != 2 {
+		t.Fatalf("immediate getScanStatus after upload 2 = %+v, want count=2", scanEnv2.ScanStatus)
+	}
+	album2, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getAlbum?f=json&id="+url.QueryEscape(song1.AlbumID), aliceAuth("album-2")))
+	assertJSONResponseEnvelope(t, album2, "ok")
+	if album2.Album == nil || album2.Album.SongCount != 2 || len(album2.Album.Song) != 2 {
+		t.Fatalf("getAlbum after upload 2 = %+v, want 2 songs", album2.Album)
+	}
+	assertStreamBytesAndRange206(t, client, baseURL, apiKeyParams(aliceAPIKey), up2.Track.ID, track2Bytes)
+
+	// overwrite=false on existing path -> 409 Conflict; original bytes preserved.
+	conflictParams := apiKeyParams(aliceAPIKey)
+	conflictParams.Set("path", relTrack1)
+	conflictParams.Set("overwrite", "false")
+	conflictResp, conflictBody := doUploadRequest(t, client, withQueryParams(baseURL+"/api/v1/upload", conflictParams), "file", "01.flac", v2Bytes)
+	if got, want := conflictResp.StatusCode, http.StatusConflict; got != want {
+		t.Fatalf("overwrite=false upload status = %d, want %d (body=%s)", got, want, string(conflictBody))
+	}
+	conflictErr := decodeUploadError(t, conflictResp, conflictBody)
+	if got, want := conflictErr.Error.Code, "conflict"; got != want {
+		t.Errorf("overwrite=false error.code = %q, want %q", got, want)
+	}
+	assertZeroUploadTempFiles(t, uploadsDir)
+	assertStreamBytesAndRange206(t, client, baseURL, apiKeyParams(bobAPIKey), up1.Track.ID, v1Bytes)
+
+	// overwrite=true on existing path -> 200 OK, preserves track ID, updates bytes & metadata.
+	overwriteParams := aliceAuth("upload-overwrite")
+	overwriteParams.Set("path", relTrack1)
+	overwriteParams.Set("overwrite", "true")
+	owResp, owBody := doUploadRequest(t, client, withQueryParams(baseURL+"/api/v1/upload", overwriteParams), "file", "01.flac", v2Bytes)
+	if got, want := owResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("overwrite=true upload status = %d, want %d (body=%s)", got, want, string(owBody))
+	}
+	ow := decodeUploadSuccess(t, owResp, owBody)
+	if ow.Status != "updated" {
+		t.Errorf("ow.Status = %q, want %q", ow.Status, "updated")
+	}
+	if ow.Track.ID != up1.Track.ID {
+		t.Errorf("ow.Track.ID = %q, want preserved ID %q", ow.Track.ID, up1.Track.ID)
+	}
+	if ow.Track.Size != int64(len(v2Bytes)) || ow.Track.Title != "Large Upload v2" {
+		t.Errorf("ow.Track = %+v, want size=%d title='Large Upload v2'", ow.Track, len(v2Bytes))
+	}
+	assertZeroUploadTempFiles(t, uploadsDir)
+
+	scanEnvAfterOW, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getScanStatus?f=json", apiKeyParams(aliceAPIKey)))
+	assertJSONResponseEnvelope(t, scanEnvAfterOW, "ok")
+	if scanEnvAfterOW.ScanStatus == nil || scanEnvAfterOW.ScanStatus.Count != 2 {
+		t.Fatalf("getScanStatus after overwrite = %+v, want count=2", scanEnvAfterOW.ScanStatus)
+	}
+	searchAfterOW, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/search3?f=json&query=v2", apiKeyParams(aliceAPIKey)))
+	assertJSONResponseEnvelope(t, searchAfterOW, "ok")
+	if searchAfterOW.SearchResult3 == nil {
+		t.Fatalf("search3 v2 missing searchResult3")
+	}
+	song1AfterOW, ok := findSongByPath(searchAfterOW.SearchResult3.Song, "uploads/"+relTrack1)
+	if !ok || song1AfterOW.ID != up1.Track.ID || song1AfterOW.Title != "Large Upload v2" {
+		t.Fatalf("search3 after overwrite = %+v (found=%v), want id=%q title='Large Upload v2'", song1AfterOW, ok, up1.Track.ID)
+	}
+	assertStreamBytesAndRange206(t, client, baseURL, aliceAuth("stream-v2"), up1.Track.ID, v2Bytes)
+
+	// Shut down server 1 cleanly and assert uploadHandler + resources closed.
+	serveErr1, timedOut1 := stopSrv1(10 * time.Second)
+	if timedOut1 || serveErr1 != nil {
+		t.Fatalf("server 1 shutdown: timedOut=%v err=%v", timedOut1, serveErr1)
+	}
+	assertResourcesClosed(t, srv1)
+	assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 2)
+
+	// Start server 2 with UPLOADS_ENABLED=false on same dataDir.
+	srv2, baseURL2, stopSrv2 := startTestServer(t, config.Config{
+		Port:           "4533",
+		MusicDir:       musicDir,
+		DataDir:        dataDir,
+		ScanInterval:   0,
+		UploadsEnabled: false,
+	})
+
+	pollScanStatus(t, client, baseURL2, aliceAuth, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
+		return !s.Scanning && s.Count == 2 && s.LastScan != ""
+	})
+
+	// Admin getUser now reports uploadRole=false in XML & JSON.
+	assertGetUserUploadRole(t, client, baseURL2, apiKeyParams(aliceAPIKey), "alice", true, false)
+
+	// Unauthenticated POST still returns 401 when UPLOADS_ENABLED=false.
+	disUnauthResp, disUnauthBody := doUploadRequest(t, client, baseURL2+"/api/v1/upload?path=Studio/Alpha/03.flac", "file", "03.flac", v1Bytes)
+	if got, want := disUnauthResp.StatusCode, http.StatusUnauthorized; got != want {
+		t.Fatalf("disabled-server unauthenticated upload status = %d, want %d (body=%s)", got, want, string(disUnauthBody))
+	}
+
+	// Admin POST returns 403 Forbidden when UPLOADS_ENABLED=false.
+	disParams := apiKeyParams(aliceAPIKey)
+	disParams.Set("path", "Studio/Alpha/03.flac")
+	disResp, disBody := doUploadRequest(t, client, withQueryParams(baseURL2+"/api/v1/upload", disParams), "file", "03.flac", v1Bytes)
+	if got, want := disResp.StatusCode, http.StatusForbidden; got != want {
+		t.Fatalf("disabled-server admin upload status = %d, want %d (body=%s)", got, want, string(disBody))
+	}
+	disErr := decodeUploadError(t, disResp, disBody)
+	if got, want := disErr.Error.Code, "forbidden"; got != want {
+		t.Errorf("disabled-server error.code = %q, want %q", got, want)
+	}
+
+	// Existing uploaded track remains streamable (200 & Range 206).
+	assertStreamBytesAndRange206(t, client, baseURL2, apiKeyParams(bobAPIKey), up1.Track.ID, v2Bytes)
+
+	serveErr2, timedOut2 := stopSrv2(10 * time.Second)
+	if timedOut2 || serveErr2 != nil {
+		t.Fatalf("server 2 shutdown: timedOut=%v err=%v", timedOut2, serveErr2)
+	}
+	assertResourcesClosed(t, srv2)
+	assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 2)
+}
+
+func assertGetUserUploadRole(
+	t *testing.T,
+	client *http.Client,
+	baseURL string,
+	params url.Values,
+	wantUser string,
+	wantAdmin, wantUpload bool,
+) {
+	t.Helper()
+
+	jsonParams := cloneValues(params)
+	jsonParams.Set("f", "json")
+	jsonEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getUser", jsonParams))
+	assertJSONResponseEnvelope(t, jsonEnv, "ok")
+	if jsonEnv.User == nil {
+		t.Fatalf("getUser JSON missing user payload")
+	}
+	if jsonEnv.User.Username != wantUser || jsonEnv.User.AdminRole != wantAdmin || jsonEnv.User.UploadRole != wantUpload {
+		t.Errorf("getUser JSON user = %+v, want username=%q adminRole=%v uploadRole=%v", jsonEnv.User, wantUser, wantAdmin, wantUpload)
+	}
+
+	xmlResp, xmlBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/getUser", params), nil, nil)
+	if got, want := xmlResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("getUser XML status = %d, want %d (body=%s)", got, want, string(xmlBody))
+	}
+	xmlEnv := decodeXMLResponse(t, xmlBody)
+	assertXMLResponseEnvelope(t, xmlEnv, "ok")
+	if xmlEnv.User == nil {
+		t.Fatalf("getUser XML missing user payload")
+	}
+	if xmlEnv.User.Username != wantUser || xmlEnv.User.AdminRole != wantAdmin || xmlEnv.User.UploadRole != wantUpload {
+		t.Errorf("getUser XML user = %+v, want username=%q adminRole=%v uploadRole=%v", xmlEnv.User, wantUser, wantAdmin, wantUpload)
+	}
+}
+
+func cloneValues(in url.Values) url.Values {
+	out := make(url.Values, len(in))
+	for k, vals := range in {
+		out[k] = append([]string(nil), vals...)
+	}
+	return out
+}
+
+func doUploadRequest(
+	t *testing.T,
+	client *http.Client,
+	rawURL string,
+	fieldName string,
+	filename string,
+	fileBytes []byte,
+) (*http.Response, []byte) {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile(fieldName, filename)
+	if err != nil {
+		t.Fatalf("CreateFormFile(%q, %q) unexpected error: %v", fieldName, filename, err)
+	}
+	if _, err := part.Write(fileBytes); err != nil {
+		t.Fatalf("part.Write() unexpected error: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("mw.Close() unexpected error: %v", err)
+	}
+	return doHTTPRequest(t, client, http.MethodPost, rawURL, &body, map[string]string{
+		"Content-Type": mw.FormDataContentType(),
+	})
+}
+
+func decodeUploadSuccess(t *testing.T, resp *http.Response, body []byte) uploadSuccessPayload {
+	t.Helper()
+	if got, want := resp.Header.Get("Content-Type"), "application/json; charset=utf-8"; got != want {
+		t.Errorf("upload Content-Type = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("X-Content-Type-Options"), "nosniff"; got != want {
+		t.Errorf("upload X-Content-Type-Options = %q, want %q", got, want)
+	}
+	var out uploadSuccessPayload
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("json.Unmarshal upload success error = %v; body = %s", err, string(body))
+	}
+	return out
+}
+
+func decodeUploadError(t *testing.T, resp *http.Response, body []byte) uploadErrorPayload {
+	t.Helper()
+	if got, want := resp.Header.Get("Content-Type"), "application/json; charset=utf-8"; got != want {
+		t.Errorf("upload error Content-Type = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("X-Content-Type-Options"), "nosniff"; got != want {
+		t.Errorf("upload error X-Content-Type-Options = %q, want %q", got, want)
+	}
+	var out uploadErrorPayload
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("json.Unmarshal upload error = %v; body = %s", err, string(body))
+	}
+	return out
+}
+
+func assertStreamBytesAndRange206(
+	t *testing.T,
+	client *http.Client,
+	baseURL string,
+	authParams url.Values,
+	trackID string,
+	wantBytes []byte,
+) {
+	t.Helper()
+	streamParams := cloneValues(authParams)
+	streamParams.Set("id", trackID)
+	streamURL := withQueryParams(baseURL+"/rest/stream", streamParams)
+
+	fullResp, fullBody := doHTTPRequest(t, client, http.MethodGet, streamURL, nil, nil)
+	if got, want := fullResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("GET /rest/stream status = %d, want %d (body=%s)", got, want, string(fullBody))
+	}
+	if !bytes.Equal(fullBody, wantBytes) {
+		t.Errorf("GET /rest/stream body len = %d, want %d bytes (mismatch)", len(fullBody), len(wantBytes))
+	}
+
+	rangeResp, rangeBody := doHTTPRequest(t, client, http.MethodGet, streamURL, nil, map[string]string{
+		"Range": "bytes=0-1023",
+	})
+	if got, want := rangeResp.StatusCode, http.StatusPartialContent; got != want {
+		t.Fatalf("GET /rest/stream Range 0-1023 status = %d, want %d", got, want)
+	}
+	wantContentRange := fmt.Sprintf("bytes 0-1023/%d", len(wantBytes))
+	if got := rangeResp.Header.Get("Content-Range"); got != wantContentRange {
+		t.Errorf("GET /rest/stream Content-Range = %q, want %q", got, wantContentRange)
+	}
+	if !bytes.Equal(rangeBody, wantBytes[:1024]) {
+		t.Errorf("GET /rest/stream Range 0-1023 body mismatch (got len=%d)", len(rangeBody))
+	}
+}
+
+func buildLargeFLAC(t *testing.T, payloadSize int, payloadFill byte, tags map[string][]string) []byte {
+	t.Helper()
+	const (
+		sampleRate    uint64 = 44100
+		channels      uint64 = 2
+		bitsPerSample uint64 = 16
+		totalSamples  uint64 = 88200 // 2s at 44100 Hz
+	)
+	buf := make([]byte, 4+4+34+payloadSize)
+	copy(buf[0:4], "fLaC")
+	buf[4] = 0x80 // last metadata block, type 0 (STREAMINFO)
+	buf[5] = 0x00
+	buf[6] = 0x00
+	buf[7] = 34
+	binary.BigEndian.PutUint16(buf[8:10], 4096)
+	binary.BigEndian.PutUint16(buf[10:12], 4096)
+	packed := (sampleRate << 44) | ((channels - 1) << 41) | ((bitsPerSample - 1) << 36) | totalSamples
+	binary.BigEndian.PutUint64(buf[18:26], packed)
+	if payloadFill != 0 {
+		for i := 42; i < len(buf); i++ {
+			buf[i] = payloadFill
+		}
+	}
+
+	tmpPath := filepath.Join(t.TempDir(), "fixture.flac")
+	testutil.WriteBytes(t, tmpPath, buf)
+	if len(tags) > 0 {
+		testutil.WriteTags(t, tmpPath, tags)
+	}
+	return mustReadFile(t, tmpPath)
+}
+
+func assertZeroUploadTempFiles(t *testing.T, uploadsDir string) {
+	t.Helper()
+	entries, err := os.ReadDir(uploadsDir)
+	if err != nil {
+		t.Fatalf("os.ReadDir(%q) error: %v", uploadsDir, err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".upload-") {
+			t.Errorf("unexpected leftover staged temp file %q in %q", entry.Name(), uploadsDir)
+		}
+	}
+}
+
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -1862,6 +2477,17 @@ func assertResourcesClosed(t *testing.T, srv *server) {
 		if !errors.Is(err, os.ErrClosed) {
 			t.Errorf("streamer.Stream(source=%q) after close error = %v, want errors.Is(err, os.ErrClosed)", src, err)
 		}
+	}
+
+	uploadReq := httptest.NewRequest(http.MethodPost, "/api/v1/upload", nil)
+	uploadRec := httptest.NewRecorder()
+	srv.uploadHandler.ServeHTTP(uploadRec, uploadReq)
+	if got, want := uploadRec.Code, http.StatusInternalServerError; got != want {
+		t.Errorf("uploadHandler.ServeHTTP() after close status = %d, want %d (body=%s)", got, want, uploadRec.Body.String())
+	}
+	errPayload := decodeUploadError(t, uploadRec.Result(), uploadRec.Body.Bytes())
+	if got, want := errPayload.Error.Code, "internal_error"; got != want {
+		t.Errorf("uploadHandler.ServeHTTP() after close error.code = %q, want %q", got, want)
 	}
 }
 

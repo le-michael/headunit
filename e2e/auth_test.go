@@ -179,13 +179,16 @@ func TestAuth(t *testing.T) {
 			if got := u.AdminRole; got != wantAdmin {
 				t.Errorf("user.AdminRole = %t, want %t", got, wantAdmin)
 			}
+			if got := u.UploadRole; got != wantAdmin {
+				t.Errorf("user.UploadRole = %t, want %t", got, wantAdmin)
+			}
 			if !u.StreamRole {
 				t.Errorf("user.StreamRole = false, want true")
 			}
 			if !slices.Equal(u.Folder, []int{1}) {
 				t.Errorf("user.Folder = %v, want [1]", u.Folder)
 			}
-			if u.ScrobblingEnabled || u.SettingsRole || u.DownloadRole || u.UploadRole ||
+			if u.ScrobblingEnabled || u.SettingsRole || u.DownloadRole ||
 				u.PlaylistRole || u.CoverArtRole || u.CommentRole || u.PodcastRole ||
 				u.JukeboxRole || u.ShareRole || u.VideoConversionRole {
 				t.Errorf("unexpected extra role/scrobbling true in %+v", *u)

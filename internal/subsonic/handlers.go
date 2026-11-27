@@ -95,6 +95,7 @@ func (h *handler) handleGetUser(w http.ResponseWriter, r *http.Request) {
 		User: &User{
 			Username:   user.Username,
 			AdminRole:  user.IsAdmin,
+			UploadRole: user.IsAdmin && h.uploadsEnabled,
 			StreamRole: true,
 			Folder:     []int{musicFolderID},
 		},
