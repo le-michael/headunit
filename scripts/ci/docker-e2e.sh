@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
+# Orchestrates the isolated Docker Compose E2E test suite against TestDockerComposeE2E.
+# Env overrides: HOST_PORT (default 127.0.0.1:), PUID (1000), PGID (1000),
+# MUSIC_MOUNT_OPTS (ro), HEALTH_TIMEOUT (90), SCAN_TIMEOUT (30s).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.yml"
 PROJECT_NAME="headunit-e2e-$$"
 
+HOST_PORT="${HOST_PORT:-127.0.0.1:}"
 PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
 MUSIC_MOUNT_OPTS="${MUSIC_MOUNT_OPTS:-ro}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
-SCAN_TIMEOUT="${SCAN_TIMEOUT:-30}"
+SCAN_TIMEOUT="${SCAN_TIMEOUT:-30s}"
 
 TMP_DIR=""
 COMPOSE_STARTED=0
@@ -35,36 +39,6 @@ cleanup() {
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap cleanup EXIT
-
-select_free_port() {
-  python3 - <<'PY'
-import socket
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.bind(("127.0.0.1", 0))
-    print(s.getsockname()[1])
-PY
-}
-
-write_smoke_wav() {
-  local wav_path="$1"
-  python3 - "$wav_path" <<'PY'
-import os
-import sys
-import wave
-
-wav_path = sys.argv[1]
-with wave.open(wav_path, "wb") as wf:
-    wf.setnchannels(1)
-    wf.setsampwidth(2)
-    wf.setframerate(8000)
-    wf.writeframes(b"\x00" * 32000)
-
-size = os.path.getsize(wav_path)
-if size != 32044:
-    raise SystemExit(f"unexpected WAV size {size}, want 32044")
-PY
-}
 
 wait_for_healthy() {
   local container_id="$1"
@@ -92,6 +66,12 @@ wait_for_healthy() {
 
     if [[ "$health" == "unhealthy" ]]; then
       echo "ERROR: container healthcheck reported unhealthy: ${state_line}" >&2
+      return 1
+    fi
+
+    # Fail fast if healthcheck is missing so restart: unless-stopped cannot spin until HEALTH_TIMEOUT.
+    if [[ "$status" == "running" && "$health" == "none" ]]; then
+      echo "ERROR: container is running without a healthcheck: ${state_line}" >&2
       return 1
     fi
 
@@ -133,98 +113,12 @@ verify_container_runtime() {
   docker exec "$container_id" ffmpeg -version >/dev/null
 }
 
-verify_opensubsonic_http() {
-  local base_url="$1"
-  python3 - "$base_url" "$SCAN_TIMEOUT" <<'PY'
-import json
-import sys
-import time
-import urllib.parse
-import urllib.request
-import xml.etree.ElementTree as ET
-
-base_url = sys.argv[1].rstrip("/")
-scan_timeout = float(sys.argv[2])
-
-
-def fetch(path, headers=None):
-    req = urllib.request.Request(f"{base_url}{path}", headers=headers or {})
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.status, resp.headers, resp.read()
-
-
-# 1. XML ping
-status, _, xml_body = fetch("/rest/ping")
-assert status == 200, f"GET /rest/ping status={status}, want 200"
-root = ET.fromstring(xml_body)
-assert root.attrib.get("status") == "ok", f"XML ping status={root.attrib.get('status')!r}"
-assert root.attrib.get("openSubsonic") == "true", f"XML ping openSubsonic={root.attrib.get('openSubsonic')!r}"
-assert root.attrib.get("type") == "headunit", f"XML ping type={root.attrib.get('type')!r}"
-
-# 2. JSON ping
-status, _, json_body = fetch("/rest/ping?f=json")
-assert status == 200, f"GET /rest/ping?f=json status={status}, want 200"
-ping_payload = json.loads(json_body)["subsonic-response"]
-assert ping_payload.get("status") == "ok", f"JSON ping status={ping_payload.get('status')!r}"
-assert ping_payload.get("openSubsonic") is True, f"JSON ping openSubsonic={ping_payload.get('openSubsonic')!r}"
-assert ping_payload.get("type") == "headunit", f"JSON ping type={ping_payload.get('type')!r}"
-
-# 3. Poll getScanStatus until scan completes with 1 track
-deadline = time.monotonic() + scan_timeout
-last_scan = None
-while True:
-    status, _, scan_body = fetch("/rest/getScanStatus?f=json")
-    assert status == 200, f"GET /rest/getScanStatus status={status}, want 200"
-    scan_payload = json.loads(scan_body)["subsonic-response"]
-    assert scan_payload.get("status") == "ok", f"getScanStatus status={scan_payload.get('status')!r}"
-    scan_status = scan_payload.get("scanStatus") or {}
-    last_scan = scan_status
-    if scan_status.get("scanning") is False and scan_status.get("count") == 1:
-        break
-    if time.monotonic() >= deadline:
-        raise SystemExit(f"timed out waiting for scan completion; last scanStatus={last_scan!r}")
-    time.sleep(0.5)
-
-# 4. search3 returns the smoke WAV track with expected metadata
-status, _, search_body = fetch("/rest/search3?f=json&query=%22%22")
-assert status == 200, f"GET /rest/search3 status={status}, want 200"
-search_payload = json.loads(search_body)["subsonic-response"]
-assert search_payload.get("status") == "ok", f"search3 status={search_payload.get('status')!r}"
-songs = (search_payload.get("searchResult3") or {}).get("song") or []
-matches = [song for song in songs if song.get("path") == "01 - Smoke Test.wav"]
-assert len(matches) == 1, f"expected 1 song matching '01 - Smoke Test.wav', got {songs!r}"
-song = matches[0]
-assert song.get("title") == "Smoke Test", f"song title={song.get('title')!r}"
-assert song.get("duration") == 2, f"song duration={song.get('duration')!r}"
-assert song.get("bitRate") == 128, f"song bitRate={song.get('bitRate')!r}"
-track_id = song.get("id")
-assert track_id, f"missing song id in {song!r}"
-
-# 5. stream with byte-range request returns 206 Partial Content and RIFF header
-stream_path = f"/rest/stream?id={urllib.parse.quote(track_id, safe='')}"
-status, headers, stream_body = fetch(stream_path, headers={"Range": "bytes=0-3"})
-assert status == 206, f"GET {stream_path} status={status}, want 206"
-assert headers.get("Content-Type") == "audio/wav", f"Content-Type={headers.get('Content-Type')!r}"
-assert headers.get("Content-Range") == "bytes 0-3/32044", f"Content-Range={headers.get('Content-Range')!r}"
-assert stream_body == b"RIFF", f"stream body={stream_body!r}, want b'RIFF'"
-
-print("OpenSubsonic HTTP smoke checks passed.")
-PY
-}
-
 main() {
-  if [[ -z "${HOST_PORT:-}" ]]; then
-    HOST_PORT="$(select_free_port)"
-  fi
-
   TMP_DIR="$(mktemp -d)"
   MUSIC_DIR="${TMP_DIR}/music"
   mkdir -p "$MUSIC_DIR"
+  # Host runner UID (e.g., 1001) may differ from non-root container PUID (1000), so allow traversal.
   chmod 0755 "$TMP_DIR" "$MUSIC_DIR"
-
-  local wav_path="${MUSIC_DIR}/01 - Smoke Test.wav"
-  write_smoke_wav "$wav_path"
-  chmod 0644 "$wav_path"
 
   export MUSIC_DIR HOST_PORT PUID PGID SCAN_INTERVAL=0 MUSIC_MOUNT_OPTS
 
@@ -232,7 +126,8 @@ main() {
   docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" up -d --build
 
   local container_id=""
-  container_id="$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" ps -q headunit)"
+  container_id="$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" ps -a -q headunit)"
+  container_id="${container_id%%$'\n'*}"
   if [[ -z "$container_id" ]]; then
     echo "ERROR: failed to resolve container ID for headunit service" >&2
     return 1
@@ -240,7 +135,26 @@ main() {
 
   wait_for_healthy "$container_id"
   verify_container_runtime "$container_id"
-  verify_opensubsonic_http "http://127.0.0.1:${HOST_PORT}"
+
+  local port_output=""
+  local port_mapping=""
+  local mapped_port=""
+  port_output="$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" port headunit 4533)"
+  port_mapping="${port_output%%$'\n'*}"
+  mapped_port="${port_mapping##*:}"
+  if [[ "$port_mapping" != *:* || ! "$mapped_port" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: failed to resolve published host port for headunit:4533 (got: '${port_output}')" >&2
+    return 1
+  fi
+  local base_url="http://127.0.0.1:${mapped_port}"
+
+  (
+    cd "$REPO_ROOT"
+    HEADUNIT_E2E_URL="$base_url" \
+    HEADUNIT_E2E_MUSIC_DIR="$MUSIC_DIR" \
+    HEADUNIT_E2E_SCAN_TIMEOUT="$SCAN_TIMEOUT" \
+      go test -tags=e2e -v -count=1 -run '^TestDockerComposeE2E$' ./cmd/headunit
+  )
 }
 
 main "$@"

@@ -30,11 +30,15 @@ jobs:
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "${unformatted}" ]; then
-            printf '::error::Unformatted Go files:\n%s\n' "${unformatted}"
+            printf '%s\n' "${unformatted}" | while IFS= read -r file; do
+              printf '::error file=%s::Go file is not formatted with gofmt\n' "$file"
+            done
             exit 1
           fi
       - name: Run go vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -tags=e2e ./...
       - name: Verify Go modules
         run: |
           go mod tidy -diff
@@ -74,6 +78,8 @@ jobs:
         run: |
           CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/headunit" ./cmd/headunit
           test -x "${RUNNER_TEMP}/headunit"
+      - name: Compile Go E2E test suite
+        run: go test -tags=e2e -c -o /dev/null ./cmd/headunit
       - name: Build Docker image
         run: docker build -t headunit:ci .
 
@@ -90,5 +96,5 @@ jobs:
           cache-dependency-path: go.sum
       - name: Run Go E2E tests
         run: go test -race -count=1 -v ./cmd/headunit
-      - name: Run Docker Compose E2E smoke test
+      - name: Run Docker Compose E2E suite
         run: ./scripts/ci/docker-e2e.sh
