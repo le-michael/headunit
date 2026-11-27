@@ -11,7 +11,7 @@ import (
 
 func clearConfigEnv(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"PORT", "MUSIC_DIR", "DATA_DIR", "SCAN_INTERVAL"} {
+	for _, key := range []string{"PORT", "MUSIC_DIR", "DATA_DIR", "SCAN_INTERVAL", "AUTH_SECRET_KEY"} {
 		t.Setenv(key, "")
 		if err := os.Unsetenv(key); err != nil {
 			t.Fatalf("os.Unsetenv(%q): %v", key, err)
@@ -37,10 +37,11 @@ func TestLoad_Valid(t *testing.T) {
 		{
 			name: "empty and whitespace fall back to defaults",
 			env: map[string]string{
-				"PORT":          "   ",
-				"MUSIC_DIR":     "",
-				"DATA_DIR":      "\t\n ",
-				"SCAN_INTERVAL": "  ",
+				"PORT":            "   ",
+				"MUSIC_DIR":       "",
+				"DATA_DIR":        "\t\n ",
+				"SCAN_INTERVAL":   "  ",
+				"AUTH_SECRET_KEY": " \t\n ",
 			},
 			want: config.Config{
 				Port:         "4533",
@@ -124,6 +125,32 @@ func TestLoad_Valid(t *testing.T) {
 				ScanInterval: 0,
 			},
 		},
+		{
+			name: "auth secret key valid 64 lowercase hex",
+			env: map[string]string{
+				"AUTH_SECRET_KEY": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			},
+			want: config.Config{
+				Port:          "4533",
+				MusicDir:      "/music",
+				DataDir:       "/data",
+				ScanInterval:  5 * time.Minute,
+				AuthSecretKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			},
+		},
+		{
+			name: "auth secret key uppercase and mixed-case with whitespace normalized to lowercase",
+			env: map[string]string{
+				"AUTH_SECRET_KEY": "  0123456789ABCDEF0123456789abcdef0123456789ABCDEF0123456789AbCdEf\n ",
+			},
+			want: config.Config{
+				Port:          "4533",
+				MusicDir:      "/music",
+				DataDir:       "/data",
+				ScanInterval:  5 * time.Minute,
+				AuthSecretKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -146,10 +173,11 @@ func TestLoad_Valid(t *testing.T) {
 
 func TestLoad_Invalid(t *testing.T) {
 	tests := []struct {
-		name        string
-		envKey      string
-		envVal      string
-		wantContain string
+		name           string
+		envKey         string
+		envVal         string
+		wantContain    string
+		wantNotContain []string
 	}{
 		{name: "port zero", envKey: "PORT", envVal: "0", wantContain: "PORT"},
 		{name: "port negative", envKey: "PORT", envVal: "-1", wantContain: "PORT"},
@@ -161,6 +189,48 @@ func TestLoad_Invalid(t *testing.T) {
 		{name: "scan interval negative minutes", envKey: "SCAN_INTERVAL", envVal: "-5m", wantContain: "SCAN_INTERVAL"},
 		{name: "scan interval missing unit", envKey: "SCAN_INTERVAL", envVal: "5", wantContain: "SCAN_INTERVAL"},
 		{name: "scan interval invalid string", envKey: "SCAN_INTERVAL", envVal: "not-a-duration", wantContain: "SCAN_INTERVAL"},
+		{
+			name:           "auth secret key too short",
+			envKey:         "AUTH_SECRET_KEY",
+			envVal:         "deadbeef" + strings.Repeat("a", 54),
+			wantContain:    "AUTH_SECRET_KEY",
+			wantNotContain: []string{"deadbeef", strings.Repeat("a", 54)},
+		},
+		{
+			name:           "auth secret key too long",
+			envKey:         "AUTH_SECRET_KEY",
+			envVal:         "cafebabe" + strings.Repeat("b", 58),
+			wantContain:    "AUTH_SECRET_KEY",
+			wantNotContain: []string{"cafebabe", strings.Repeat("b", 58)},
+		},
+		{
+			name:           "auth secret key odd length",
+			envKey:         "AUTH_SECRET_KEY",
+			envVal:         "feedface" + strings.Repeat("c", 55),
+			wantContain:    "AUTH_SECRET_KEY",
+			wantNotContain: []string{"feedface", strings.Repeat("c", 55)},
+		},
+		{
+			name:           "auth secret key 0x prefix 64 chars",
+			envKey:         "AUTH_SECRET_KEY",
+			envVal:         "0x" + "deadbeef" + strings.Repeat("d", 54),
+			wantContain:    "AUTH_SECRET_KEY",
+			wantNotContain: []string{"0x", "deadbeef"},
+		},
+		{
+			name:           "auth secret key 0x prefix 66 chars",
+			envKey:         "AUTH_SECRET_KEY",
+			envVal:         "0x" + "cafebabe" + strings.Repeat("e", 56),
+			wantContain:    "AUTH_SECRET_KEY",
+			wantNotContain: []string{"0x", "cafebabe"},
+		},
+		{
+			name:           "auth secret key non-hex char",
+			envKey:         "AUTH_SECRET_KEY",
+			envVal:         "deadbeef" + strings.Repeat("f", 55) + "Z",
+			wantContain:    "AUTH_SECRET_KEY",
+			wantNotContain: []string{"deadbeef", "Z"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -174,6 +244,14 @@ func TestLoad_Invalid(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantContain) {
 				t.Errorf("Load() error = %q, want substring %q", err.Error(), tc.wantContain)
+			}
+			if tc.envKey == "AUTH_SECRET_KEY" && strings.Contains(err.Error(), strings.TrimSpace(tc.envVal)) {
+				t.Errorf("Load() error = %q leaked raw AUTH_SECRET_KEY value", err.Error())
+			}
+			for _, forbidden := range tc.wantNotContain {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Errorf("Load() error = %q leaked forbidden substring %q", err.Error(), forbidden)
+				}
 			}
 		})
 	}
