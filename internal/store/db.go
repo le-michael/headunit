@@ -1,4 +1,4 @@
-// Package store provides Headunit's embedded SQLite WAL track store and queries.
+// Package store provides Headunit's embedded SQLite WAL track and authentication store.
 package store
 
 import (
@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	schemaVersion = 1
+	schemaVersion = 2
 
 	// writeDSNQuery configures the writer pool in WAL mode with immediate write
 	// transactions so concurrent readers never block and read-to-write lock
@@ -31,10 +31,12 @@ const (
 	readMaxConns  = 4
 )
 
-var schemaV1Statements = [...]struct {
+type schemaStatement struct {
 	name string
 	sql  string
-}{
+}
+
+var schemaV1Statements = [...]schemaStatement{
 	{
 		name: "create tracks table",
 		sql: `CREATE TABLE IF NOT EXISTS tracks (
@@ -71,19 +73,54 @@ var schemaV1Statements = [...]struct {
 	},
 }
 
+var schemaV2Statements = [...]schemaStatement{
+	{
+		name: "create users table",
+		sql: `CREATE TABLE IF NOT EXISTS users (
+			id                  TEXT PRIMARY KEY,
+			username            TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			password_ciphertext BLOB NOT NULL,
+			is_admin            INTEGER NOT NULL DEFAULT 0,
+			disabled            INTEGER NOT NULL DEFAULT 0,
+			created_at          TEXT NOT NULL,
+			updated_at          TEXT NOT NULL
+		)`,
+	},
+	{
+		name: "create api_keys table",
+		sql: `CREATE TABLE IF NOT EXISTS api_keys (
+			id         TEXT PRIMARY KEY,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name       TEXT NOT NULL DEFAULT '',
+			key_prefix TEXT NOT NULL,
+			key_hash   TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL,
+			revoked_at TEXT NOT NULL DEFAULT ''
+		)`,
+	},
+	{
+		name: "create api_keys user_id index",
+		sql:  `CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys (user_id, created_at)`,
+	},
+	{
+		name: "set schema user_version to 2",
+		sql:  `PRAGMA user_version = 2`,
+	},
+}
+
 // Store manages dedicated SQLite WAL writer and read-only reader pools over
-// Headunit's embedded track database. All methods on Store are safe for
-// concurrent use.
+// Headunit's embedded track and authentication database. All methods on Store
+// are safe for concurrent use.
 type Store struct {
 	writeDB *sql.DB
 	readDB  *sql.DB
 }
 
 // Open opens or creates the SQLite WAL database at the filesystem path dbPath,
-// ensures its parent directory exists, verifies WAL mode, bootstraps schema
-// version 1 atomically, and initializes dedicated writer and read-only reader
-// pools. It rejects empty paths, directory paths, SQLite :memory:/file: URIs,
-// and databases whose PRAGMA user_version is neither 0 nor 1.
+// ensures its parent directory exists, verifies WAL mode, bootstraps or
+// migrates the schema to version 2 atomically, and initializes dedicated writer
+// and read-only reader pools. It rejects empty paths, directory paths, SQLite
+// :memory:/file: URIs, and databases whose PRAGMA user_version is not 0, 1, or 2.
 func Open(ctx context.Context, dbPath string) (*Store, error) {
 	absPath, err := resolveDBPath(dbPath)
 	if err != nil {
@@ -215,19 +252,33 @@ func bootstrapSchema(ctx context.Context, db *sql.DB) error {
 
 	switch version {
 	case 0:
-		for _, stmt := range schemaV1Statements {
-			if _, err := tx.ExecContext(ctx, stmt.sql); err != nil {
-				return fmt.Errorf("store: %s: %w", stmt.name, err)
-			}
+		if err := execSchemaStatements(ctx, tx, schemaV1Statements[:]); err != nil {
+			return err
+		}
+		if err := execSchemaStatements(ctx, tx, schemaV2Statements[:]); err != nil {
+			return err
+		}
+	case 1:
+		if err := execSchemaStatements(ctx, tx, schemaV2Statements[:]); err != nil {
+			return err
 		}
 	case schemaVersion:
 		// Already initialized at current schema version.
 	default:
-		return fmt.Errorf("store: unsupported schema version %d (want 0 or %d)", version, schemaVersion)
+		return fmt.Errorf("store: unsupported schema version %d (want 0, 1, or %d)", version, schemaVersion)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit schema bootstrap tx: %w", err)
+	}
+	return nil
+}
+
+func execSchemaStatements(ctx context.Context, tx *sql.Tx, stmts []schemaStatement) error {
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt.sql); err != nil {
+			return fmt.Errorf("store: %s: %w", stmt.name, err)
+		}
 	}
 	return nil
 }

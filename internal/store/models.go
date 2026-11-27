@@ -7,8 +7,13 @@ import (
 )
 
 // ErrNotFound is returned (typically wrapped) when a requested artist, album,
-// or track does not exist. Callers should match it with errors.Is.
+// track, user, or API key does not exist. Callers should match it with errors.Is.
 var ErrNotFound = errors.New("store: not found")
+
+// ErrAlreadyExists is returned (typically wrapped) when creating a user or API
+// key violates a uniqueness constraint (such as a duplicate username, ID, or
+// key hash). Callers should match it with errors.Is.
+var ErrAlreadyExists = errors.New("store: already exists")
 
 // MaxPageLimit is the upper bound enforced on paginated album and search queries.
 const MaxPageLimit = 500
@@ -205,6 +210,71 @@ type Search3Result struct {
 	Songs []Track
 }
 
+// User represents an authenticated Headunit account persisted in the users table.
+type User struct {
+	// ID is the opaque stable user identifier ("usr_" + 32 hex chars).
+	ID string
+
+	// Username is the account login name, unique case-insensitively.
+	Username string
+
+	// PasswordCiphertext holds the encrypted password blob stored for Subsonic auth.
+	PasswordCiphertext []byte
+
+	// IsAdmin reports whether the account has administrative privileges.
+	IsAdmin bool
+
+	// Disabled reports whether the account is barred from authenticating.
+	Disabled bool
+
+	// CreatedAt is the UTC timestamp (second precision) when the user was created.
+	CreatedAt time.Time
+
+	// UpdatedAt is the UTC timestamp (second precision) when the user was last updated.
+	UpdatedAt time.Time
+}
+
+// APIKey represents a persisted OpenSubsonic API key record in the api_keys table.
+type APIKey struct {
+	// ID is the opaque stable API key identifier ("key_" + 32 hex chars).
+	ID string
+
+	// UserID references the owning user's ID.
+	UserID string
+
+	// Username is populated via JOIN on read queries; ignored by CreateAPIKey.
+	Username string
+
+	// Name is an optional label stored verbatim (may be empty).
+	Name string
+
+	// KeyPrefix is the non-secret display prefix.
+	KeyPrefix string
+
+	// KeyHash is the lowercase hex SHA-256 hash of the plaintext key.
+	KeyHash string
+
+	// CreatedAt is the UTC timestamp (second precision) when the key was created.
+	CreatedAt time.Time
+
+	// RevokedAt is the UTC timestamp when revoked, or zero time.Time when active.
+	RevokedAt time.Time
+}
+
+// APIKeyLookup holds the joined API key record and owning account flags returned
+// by Store.LookupAPIKeyByHash for read-only request authentication. It avoids
+// loading password_ciphertext on the API-key hot path.
+type APIKeyLookup struct {
+	// Key is the persisted API key record including the owning Username.
+	Key APIKey
+
+	// UserIsAdmin reports whether the owning user is an administrator.
+	UserIsAdmin bool
+
+	// UserDisabled reports whether the owning user account is disabled.
+	UserDisabled bool
+}
+
 // formatCreatedAt renders t as fixed-width UTC RFC3339 (YYYY-MM-DDTHH:MM:SSZ)
 // so SQLite lexicographical MIN/MAX ordering matches chronological order.
 func formatCreatedAt(t time.Time) string {
@@ -212,9 +282,20 @@ func formatCreatedAt(t time.Time) string {
 }
 
 func parseCreatedAt(raw string) (time.Time, error) {
+	return parseTimestamp("created_at", raw)
+}
+
+func parseTimestamp(field, raw string) (time.Time, error) {
 	t, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("parse created_at %q: %w", raw, err)
+		return time.Time{}, fmt.Errorf("parse %s %q: %w", field, raw, err)
 	}
 	return t.UTC(), nil
+}
+
+func parseOptionalTimestamp(field, raw string) (time.Time, error) {
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	return parseTimestamp(field, raw)
 }
