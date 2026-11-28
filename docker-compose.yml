@@ -12,6 +12,8 @@ services:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
       AUTH_SECRET_KEY: "${AUTH_SECRET_KEY:-}"
+      UPLOADS_ENABLED: "${UPLOADS_ENABLED:-true}"
+      UPLOAD_MAX_FILE_BYTES: "${UPLOAD_MAX_FILE_BYTES:-268435456}"
     volumes:
       # Mount the music library read-only. On SELinux-enforcing hosts, set
       # MUSIC_MOUNT_OPTS=ro,z in .env (avoid :z on /home/$USER or NFS/SMB mounts).

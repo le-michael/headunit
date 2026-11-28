@@ -1261,3 +1261,552 @@ func TestDirectStreamer_CloseAndConcurrency(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+func TestNewDirectStreamer_NoFDLeakOnUploadsFailure(t *testing.T) {
+	// Intentionally sequential (no t.Parallel) so /proc/self/fd counts are not
+	// perturbed by concurrent tests opening or closing file descriptors.
+	if _, err := os.ReadDir("/proc/self/fd"); err != nil {
+		t.Skipf("/proc/self/fd unavailable: %v", err)
+	}
+
+	baseDir := t.TempDir()
+	musicDir := filepath.Join(baseDir, "music")
+	if err := os.Mkdir(musicDir, 0o755); err != nil {
+		t.Fatalf("os.Mkdir(%q): %v", musicDir, err)
+	}
+	missingUploads := filepath.Join(baseDir, "missing-uploads")
+
+	beforeFDs, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("os.ReadDir(/proc/self/fd) before: %v", err)
+	}
+
+	ds, err := stream.NewDirectStreamer(musicDir, stream.WithUploadsDir(missingUploads))
+	if err == nil {
+		_ = ds.Close()
+		t.Fatalf("NewDirectStreamer(%q, WithUploadsDir(%q)) = nil, want error", musicDir, missingUploads)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("NewDirectStreamer error = %v, want os.ErrNotExist", err)
+	}
+
+	afterFDs, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("os.ReadDir(/proc/self/fd) after: %v", err)
+	}
+	if len(afterFDs) != len(beforeFDs) {
+		t.Fatalf("open FD count = %d after failed NewDirectStreamer, want %d (music root leaked)", len(afterFDs), len(beforeFDs))
+	}
+}
+
+func TestDirectStreamer_MultiRoot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("WithUploadsDir constructor validation", func(t *testing.T) {
+		t.Parallel()
+
+		baseDir := t.TempDir()
+		musicDir := filepath.Join(baseDir, "music")
+		uploadsDir := filepath.Join(baseDir, "uploads")
+		if err := os.Mkdir(musicDir, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", musicDir, err)
+		}
+		if err := os.Mkdir(uploadsDir, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", uploadsDir, err)
+		}
+		regularFile := filepath.Join(baseDir, "not-a-dir.wav")
+		testutil.WriteMinimalWAV(t, regularFile)
+
+		unreadableUploads := filepath.Join(baseDir, "unreadable-uploads")
+		if err := os.Mkdir(unreadableUploads, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", unreadableUploads, err)
+		}
+
+		tests := []struct {
+			name       string
+			opts       []stream.DirectOption
+			setup      func(t *testing.T)
+			skipIfRoot bool
+			wantErr    bool
+			wantTarget error
+		}{
+			{
+				name: "valid uploads dir",
+				opts: []stream.DirectOption{stream.WithUploadsDir(uploadsDir)},
+			},
+			{
+				name: "empty uploads dir ignored",
+				opts: []stream.DirectOption{stream.WithUploadsDir("")},
+			},
+			{
+				name: "whitespace uploads dir ignored",
+				opts: []stream.DirectOption{stream.WithUploadsDir("  \t\n ")},
+			},
+			{
+				name: "nil option ignored",
+				opts: []stream.DirectOption{nil, stream.WithUploadsDir(uploadsDir)},
+			},
+			{
+				name:       "missing uploads dir returns error",
+				opts:       []stream.DirectOption{stream.WithUploadsDir(filepath.Join(baseDir, "missing"))},
+				wantErr:    true,
+				wantTarget: os.ErrNotExist,
+			},
+			{
+				name:    "regular file uploads dir returns error",
+				opts:    []stream.DirectOption{stream.WithUploadsDir(regularFile)},
+				wantErr: true,
+			},
+			{
+				name:       "unreadable uploads dir returns permission error",
+				opts:       []stream.DirectOption{stream.WithUploadsDir(unreadableUploads)},
+				skipIfRoot: true,
+				setup: func(t *testing.T) {
+					t.Helper()
+					if err := os.Chmod(unreadableUploads, 0o000); err != nil {
+						t.Fatalf("os.Chmod(%q, 0o000): %v", unreadableUploads, err)
+					}
+					t.Cleanup(func() {
+						_ = os.Chmod(unreadableUploads, 0o755)
+					})
+				},
+				wantErr:    true,
+				wantTarget: os.ErrPermission,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				if tc.skipIfRoot && os.Geteuid() == 0 {
+					t.Skip("skipping permission test when running as root")
+				}
+				if tc.setup != nil {
+					tc.setup(t)
+				}
+
+				ds, err := stream.NewDirectStreamer(musicDir, tc.opts...)
+				if tc.wantErr {
+					if err == nil {
+						if ds != nil {
+							_ = ds.Close()
+						}
+						t.Fatalf("NewDirectStreamer() = nil error, want error")
+					}
+					if tc.wantTarget != nil && !errors.Is(err, tc.wantTarget) {
+						t.Fatalf("NewDirectStreamer() error = %v, want errors.Is(..., %v)", err, tc.wantTarget)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("NewDirectStreamer() unexpected error: %v", err)
+				}
+				if err := ds.Close(); err != nil {
+					t.Fatalf("ds.Close() unexpected error: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("identical relPath isolation, ranges, HEAD, and ETag disambiguation", func(t *testing.T) {
+		t.Parallel()
+
+		baseDir := t.TempDir()
+		musicDir := filepath.Join(baseDir, "music")
+		uploadsDir := filepath.Join(baseDir, "uploads")
+		if err := os.Mkdir(musicDir, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", musicDir, err)
+		}
+		if err := os.Mkdir(uploadsDir, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", uploadsDir, err)
+		}
+
+		relPath := "Artist/Album/01.wav"
+		musicBytes := append(testutil.MinimalWAVBytes(), []byte("MUSIC-ROOT-PAYLOAD")...)
+		uploadsBytes := append(testutil.MinimalWAVBytes(), []byte("UPLOAD-ROOT-DATA!!")...)
+		if len(musicBytes) != len(uploadsBytes) {
+			t.Fatalf("test fixture sizes differ: %d vs %d", len(musicBytes), len(uploadsBytes))
+		}
+
+		musicFile := filepath.Join(musicDir, filepath.FromSlash(relPath))
+		uploadsFile := filepath.Join(uploadsDir, filepath.FromSlash(relPath))
+		testutil.WriteBytes(t, musicFile, musicBytes)
+		testutil.WriteBytes(t, uploadsFile, uploadsBytes)
+
+		// Pin identical mtime so ETag disambiguation depends solely on root source.
+		fixedTime := time.Unix(1700000000, 123456000)
+		for _, p := range []string{musicFile, uploadsFile} {
+			if err := os.Chtimes(p, fixedTime, fixedTime); err != nil {
+				t.Fatalf("os.Chtimes(%q): %v", p, err)
+			}
+		}
+
+		ds, err := stream.NewDirectStreamer(musicDir, stream.WithUploadsDir(uploadsDir))
+		if err != nil {
+			t.Fatalf("NewDirectStreamer(): %v", err)
+		}
+		t.Cleanup(func() {
+			if err := ds.Close(); err != nil {
+				t.Errorf("ds.Close(): %v", err)
+			}
+		})
+
+		cases := []struct {
+			name   string
+			source string
+			want   []byte
+		}{
+			{name: "empty source defaults to music", source: "", want: musicBytes},
+			{name: "explicit SourceMusic", source: store.SourceMusic, want: musicBytes},
+			{name: "SourceUploads", source: store.SourceUploads, want: uploadsBytes},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				tr := &store.Track{
+					ID:      "tr_shared_" + tc.source,
+					Source:  tc.source,
+					RelPath: relPath,
+				}
+
+				// 200 full body
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, "/rest/stream", nil)
+				if err := ds.Stream(rec, req, tr, stream.StreamOptions{}); err != nil {
+					t.Fatalf("200 Stream() error: %v", err)
+				}
+				if rec.Code != http.StatusOK {
+					t.Fatalf("200 status = %d, want %d", rec.Code, http.StatusOK)
+				}
+				if got := rec.Header().Get("Content-Type"); got != "audio/wav" {
+					t.Errorf("Content-Type = %q, want %q", got, "audio/wav")
+				}
+				if !bytes.Equal(rec.Body.Bytes(), tc.want) {
+					t.Errorf("200 body mismatch for source %q", tc.source)
+				}
+
+				// 206 byte range on distinct tail bytes
+				start := len(tc.want) - 18
+				end := len(tc.want) - 1
+				rangeRec := httptest.NewRecorder()
+				rangeReq := httptest.NewRequest(http.MethodGet, "/rest/stream", nil)
+				rangeReq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+				if err := ds.Stream(rangeRec, rangeReq, tr, stream.StreamOptions{}); err != nil {
+					t.Fatalf("206 Stream() error: %v", err)
+				}
+				if rangeRec.Code != http.StatusPartialContent {
+					t.Fatalf("206 status = %d, want %d", rangeRec.Code, http.StatusPartialContent)
+				}
+				if !bytes.Equal(rangeRec.Body.Bytes(), tc.want[start:]) {
+					t.Errorf("206 body = %q, want %q", rangeRec.Body.String(), string(tc.want[start:]))
+				}
+
+				// 416 out-of-bounds range
+				oobRec := httptest.NewRecorder()
+				oobReq := httptest.NewRequest(http.MethodGet, "/rest/stream", nil)
+				oobReq.Header.Set("Range", "bytes=999999-")
+				if err := ds.Stream(oobRec, oobReq, tr, stream.StreamOptions{}); err != nil {
+					t.Fatalf("416 Stream() error: %v", err)
+				}
+				if oobRec.Code != http.StatusRequestedRangeNotSatisfiable {
+					t.Fatalf("416 status = %d, want %d", oobRec.Code, http.StatusRequestedRangeNotSatisfiable)
+				}
+				wantContentRange := fmt.Sprintf("bytes */%d", len(tc.want))
+				if got := oobRec.Header().Get("Content-Range"); got != wantContentRange {
+					t.Errorf("416 Content-Range = %q, want %q", got, wantContentRange)
+				}
+
+				// HEAD
+				headRec := httptest.NewRecorder()
+				headReq := httptest.NewRequest(http.MethodHead, "/rest/stream", nil)
+				if err := ds.Stream(headRec, headReq, tr, stream.StreamOptions{}); err != nil {
+					t.Fatalf("HEAD Stream() error: %v", err)
+				}
+				if headRec.Code != http.StatusOK {
+					t.Fatalf("HEAD status = %d, want %d", headRec.Code, http.StatusOK)
+				}
+				if headRec.Body.Len() != 0 {
+					t.Errorf("HEAD body len = %d, want 0", headRec.Body.Len())
+				}
+				if got := headRec.Header().Get("Content-Length"); got != fmt.Sprintf("%d", len(tc.want)) {
+					t.Errorf("HEAD Content-Length = %q, want %d", got, len(tc.want))
+				}
+			})
+		}
+
+		// ETag disambiguation when Track.ID is empty or invalid for RFC 9110 etagc.
+		for _, idCase := range []struct {
+			name    string
+			trackID string
+		}{
+			{name: "empty track ID", trackID: ""},
+			{name: "invalid RFC 9110 track ID", trackID: "bad \"id\"\r\n"},
+		} {
+			t.Run("ETag disambiguation: "+idCase.name, func(t *testing.T) {
+				musicRec := httptest.NewRecorder()
+				if err := ds.Stream(musicRec, httptest.NewRequest(http.MethodGet, "/rest/stream", nil), &store.Track{
+					ID:      idCase.trackID,
+					Source:  store.SourceMusic,
+					RelPath: relPath,
+				}, stream.StreamOptions{}); err != nil {
+					t.Fatalf("music Stream() error: %v", err)
+				}
+
+				uploadsRec := httptest.NewRecorder()
+				if err := ds.Stream(uploadsRec, httptest.NewRequest(http.MethodGet, "/rest/stream", nil), &store.Track{
+					ID:      idCase.trackID,
+					Source:  store.SourceUploads,
+					RelPath: relPath,
+				}, stream.StreamOptions{}); err != nil {
+					t.Fatalf("uploads Stream() error: %v", err)
+				}
+
+				musicETag := musicRec.Header().Get("ETag")
+				uploadsETag := uploadsRec.Header().Get("ETag")
+				if musicETag == "" || uploadsETag == "" {
+					t.Fatalf("expected non-empty ETags, got music=%q uploads=%q", musicETag, uploadsETag)
+				}
+				if musicETag == uploadsETag {
+					t.Errorf("ETags collided across sources for same relPath: both %q", musicETag)
+				}
+			})
+		}
+	})
+
+	t.Run("source errors, uploads confinement, and post-Close", func(t *testing.T) {
+		t.Parallel()
+
+		outerDir := t.TempDir()
+		musicDir := filepath.Join(outerDir, "music")
+		uploadsDir := filepath.Join(outerDir, "uploads")
+		if err := os.Mkdir(musicDir, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", musicDir, err)
+		}
+		if err := os.Mkdir(uploadsDir, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", uploadsDir, err)
+		}
+
+		outsideSecret := filepath.Join(outerDir, "secret.wav")
+		testutil.WriteMinimalWAV(t, outsideSecret)
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "song.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "nested", "upload.wav"))
+
+		// Symlinks inside uploadsDir.
+		if err := os.Symlink("../secret.wav", filepath.Join(uploadsDir, "escape-rel.wav")); err != nil {
+			t.Fatalf("os.Symlink escape-rel: %v", err)
+		}
+		if err := os.Symlink(outsideSecret, filepath.Join(uploadsDir, "escape-abs-out.wav")); err != nil {
+			t.Fatalf("os.Symlink escape-abs-out: %v", err)
+		}
+		if err := os.Symlink(filepath.Join(uploadsDir, "nested", "upload.wav"), filepath.Join(uploadsDir, "escape-abs-in.wav")); err != nil {
+			t.Fatalf("os.Symlink escape-abs-in: %v", err)
+		}
+		if err := os.Symlink("missing.wav", filepath.Join(uploadsDir, "dangling.wav")); err != nil {
+			t.Fatalf("os.Symlink dangling: %v", err)
+		}
+		if err := os.Symlink("nested/upload.wav", filepath.Join(uploadsDir, "ok-link.wav")); err != nil {
+			t.Fatalf("os.Symlink ok-link: %v", err)
+		}
+
+		singleRootDS, err := stream.NewDirectStreamer(musicDir)
+		if err != nil {
+			t.Fatalf("NewDirectStreamer(single): %v", err)
+		}
+		t.Cleanup(func() {
+			if err := singleRootDS.Close(); err != nil {
+				t.Errorf("singleRootDS.Close(): %v", err)
+			}
+		})
+
+		multiRootDS, err := stream.NewDirectStreamer(musicDir, stream.WithUploadsDir(uploadsDir))
+		if err != nil {
+			t.Fatalf("NewDirectStreamer(multi): %v", err)
+		}
+		t.Cleanup(func() {
+			if err := multiRootDS.Close(); err != nil {
+				t.Errorf("multiRootDS.Close(): %v", err)
+			}
+		})
+
+		// Valid intra-root symlink in uploadsDir succeeds.
+		okRec := httptest.NewRecorder()
+		if err := multiRootDS.Stream(okRec, httptest.NewRequest(http.MethodGet, "/rest/stream", nil), &store.Track{
+			ID:      "tr_ok_upload_link",
+			Source:  store.SourceUploads,
+			RelPath: "ok-link.wav",
+		}, stream.StreamOptions{}); err != nil {
+			t.Fatalf("uploads intra-root symlink Stream() error: %v", err)
+		}
+		if okRec.Code != http.StatusOK || !bytes.Equal(okRec.Body.Bytes(), testutil.MinimalWAVBytes()) {
+			t.Fatalf("uploads intra-root symlink mismatch: status=%d len=%d", okRec.Code, okRec.Body.Len())
+		}
+
+		errorCases := []struct {
+			name     string
+			streamer *stream.DirectStreamer
+			track    *store.Track
+		}{
+			{
+				name:     "unknown source on multi-root streamer",
+				streamer: multiRootDS,
+				track:    &store.Track{ID: "tr_1", Source: "other", RelPath: "song.wav"},
+			},
+			{
+				name:     "uppercase source rejected",
+				streamer: multiRootDS,
+				track:    &store.Track{ID: "tr_2", Source: "MUSIC", RelPath: "song.wav"},
+			},
+			{
+				name:     "SourceUploads on single-root streamer",
+				streamer: singleRootDS,
+				track:    &store.Track{ID: "tr_3", Source: store.SourceUploads, RelPath: "nested/upload.wav"},
+			},
+			{
+				name:     "SourceUploads on whitespace-ignored uploads streamer",
+				streamer: singleRootDS,
+				track:    &store.Track{ID: "tr_4", Source: store.SourceUploads, RelPath: "missing.wav"},
+			},
+			{
+				name:     "uploads relative symlink escape",
+				streamer: multiRootDS,
+				track:    &store.Track{ID: "tr_5", Source: store.SourceUploads, RelPath: "escape-rel.wav"},
+			},
+			{
+				name:     "uploads absolute symlink outside root",
+				streamer: multiRootDS,
+				track:    &store.Track{ID: "tr_6", Source: store.SourceUploads, RelPath: "escape-abs-out.wav"},
+			},
+			{
+				name:     "uploads absolute symlink inside root",
+				streamer: multiRootDS,
+				track:    &store.Track{ID: "tr_7", Source: store.SourceUploads, RelPath: "escape-abs-in.wav"},
+			},
+			{
+				name:     "uploads dangling symlink",
+				streamer: multiRootDS,
+				track:    &store.Track{ID: "tr_8", Source: store.SourceUploads, RelPath: "dangling.wav"},
+			},
+			{
+				name:     "uploads path traversal",
+				streamer: multiRootDS,
+				track:    &store.Track{ID: "tr_9", Source: store.SourceUploads, RelPath: "../music/song.wav"},
+			},
+		}
+
+		for _, tc := range errorCases {
+			t.Run(tc.name, func(t *testing.T) {
+				spy := newSpyResponseWriter()
+				spy.rec.Header().Set("Access-Control-Allow-Origin", "*")
+				req := httptest.NewRequest(http.MethodGet, "/rest/stream", nil)
+
+				err := tc.streamer.Stream(spy, req, tc.track, stream.StreamOptions{})
+				if !errors.Is(err, stream.ErrFileNotFound) {
+					t.Fatalf("Stream() error = %v, want errors.Is(..., ErrFileNotFound)", err)
+				}
+				if strings.Contains(err.Error(), musicDir) || strings.Contains(err.Error(), uploadsDir) || strings.Contains(err.Error(), outerDir) {
+					t.Errorf("error %q leaked host path", err.Error())
+				}
+				spy.assertUntouched(t)
+				if got := spy.rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+					t.Errorf("pre-existing CORS header = %q, want %q", got, "*")
+				}
+			})
+		}
+
+		t.Run("post-Close returns os.ErrClosed for both roots", func(t *testing.T) {
+			ds, err := stream.NewDirectStreamer(musicDir, stream.WithUploadsDir(uploadsDir))
+			if err != nil {
+				t.Fatalf("NewDirectStreamer(): %v", err)
+			}
+			if err := ds.Close(); err != nil {
+				t.Fatalf("first Close(): %v", err)
+			}
+			if err := ds.Close(); err != nil {
+				t.Fatalf("second Close(): %v", err)
+			}
+
+			for _, tr := range []*store.Track{
+				{ID: "tr_m", Source: store.SourceMusic, RelPath: "song.wav"},
+				{ID: "tr_u", Source: store.SourceUploads, RelPath: "nested/upload.wav"},
+			} {
+				spy := newSpyResponseWriter()
+				err := ds.Stream(spy, httptest.NewRequest(http.MethodGet, "/rest/stream", nil), tr, stream.StreamOptions{})
+				if !errors.Is(err, os.ErrClosed) || errors.Is(err, stream.ErrFileNotFound) {
+					t.Errorf("post-Close Stream(%q) = %v, want os.ErrClosed and not ErrFileNotFound", tr.Source, err)
+				}
+				spy.assertUntouched(t)
+			}
+		})
+	})
+
+	t.Run("concurrent multi-root Stream and Close under -race", func(t *testing.T) {
+		t.Parallel()
+
+		baseDir := t.TempDir()
+		musicDir := filepath.Join(baseDir, "music")
+		uploadsDir := filepath.Join(baseDir, "uploads")
+		if err := os.Mkdir(musicDir, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", musicDir, err)
+		}
+		if err := os.Mkdir(uploadsDir, 0o755); err != nil {
+			t.Fatalf("os.Mkdir(%q): %v", uploadsDir, err)
+		}
+
+		musicWAV := append(testutil.MinimalWAVBytes(), []byte("MUSIC")...)
+		uploadsWAV := append(testutil.MinimalWAVBytes(), []byte("UPLOADS")...)
+		testutil.WriteBytes(t, filepath.Join(musicDir, "song.wav"), musicWAV)
+		testutil.WriteBytes(t, filepath.Join(uploadsDir, "song.wav"), uploadsWAV)
+
+		ds, err := stream.NewDirectStreamer(musicDir, stream.WithUploadsDir(uploadsDir))
+		if err != nil {
+			t.Fatalf("NewDirectStreamer(): %v", err)
+		}
+
+		const readers = 16
+		var wg sync.WaitGroup
+		wg.Add(readers + 2)
+
+		for i := range readers {
+			go func(idx int) {
+				defer wg.Done()
+				source := store.SourceMusic
+				want := musicWAV
+				if idx%2 == 1 {
+					source = store.SourceUploads
+					want = uploadsWAV
+				}
+				for range 5 {
+					spy := newSpyResponseWriter()
+					req := httptest.NewRequest(http.MethodGet, "/rest/stream", nil)
+					err := ds.Stream(spy, req, &store.Track{
+						ID:      fmt.Sprintf("tr_%d", idx),
+						Source:  source,
+						RelPath: "song.wav",
+					}, stream.StreamOptions{})
+					if err == nil {
+						if spy.rec.Code != http.StatusOK || !bytes.Equal(spy.rec.Body.Bytes(), want) {
+							t.Errorf("worker %d (%s) mismatch: status=%d len=%d want=%d", idx, source, spy.rec.Code, spy.rec.Body.Len(), len(want))
+						}
+						continue
+					}
+					if !errors.Is(err, os.ErrClosed) || errors.Is(err, stream.ErrFileNotFound) {
+						t.Errorf("worker %d (%s) closed Stream err = %v, want os.ErrClosed and not ErrFileNotFound", idx, source, err)
+					}
+					if spy.headerCalls != 0 || spy.writeHeaderCalls != 0 || spy.writeCalls != 0 {
+						t.Errorf("worker %d (%s) mutated spy on error", idx, source)
+					}
+				}
+			}(i)
+		}
+
+		for range 2 {
+			go func() {
+				defer wg.Done()
+				if err := ds.Close(); err != nil {
+					t.Errorf("concurrent Close() = %v, want nil", err)
+				}
+			}()
+		}
+
+		wg.Wait()
+	})
+}

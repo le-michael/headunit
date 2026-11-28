@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	trackColumns = `id, rel_path, file_size, mtime_ns, title, artist, album_artist,
+	trackColumns = `id, source, rel_path, file_size, mtime_ns, title, artist, album_artist,
 		artist_id, album, album_id, track_num, disc_num, year, genre,
 		duration_sec, bit_rate, created_at`
 
@@ -417,6 +417,7 @@ func scanTrack(s rowScanner) (Track, error) {
 	)
 	err := s.Scan(
 		&t.ID,
+		&t.Source,
 		&t.RelPath,
 		&t.FileSize,
 		&t.MtimeNs,

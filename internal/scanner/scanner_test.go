@@ -113,10 +113,10 @@ func openTestStore(t *testing.T) *store.Store {
 	return st
 }
 
-func newTestService(t *testing.T, musicDir string, scanInterval time.Duration, st *store.Store, logger *slog.Logger) *Service {
+func newTestService(t *testing.T, musicDir string, scanInterval time.Duration, st *store.Store, logger *slog.Logger, opts ...Option) *Service {
 	t.Helper()
 
-	svc, err := New(musicDir, scanInterval, st, logger)
+	svc, err := New(musicDir, scanInterval, st, logger, opts...)
 	if err != nil {
 		t.Fatalf("New(%q) unexpected error: %v", musicDir, err)
 	}
@@ -170,21 +170,31 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, cond fun
 
 func loadSnapshotsMap(t *testing.T, st *store.Store) map[string]store.TrackSnapshot {
 	t.Helper()
+	return loadSourceSnapshotsMap(t, st, store.SourceMusic)
+}
 
-	snaps, err := st.LoadSnapshots(context.Background())
+func loadSourceSnapshotsMap(t *testing.T, st *store.Store, source string) map[string]store.TrackSnapshot {
+	t.Helper()
+
+	snaps, err := st.LoadSnapshots(context.Background(), source)
 	if err != nil {
-		t.Fatalf("LoadSnapshots() unexpected error: %v", err)
+		t.Fatalf("LoadSnapshots(%q) unexpected error: %v", source, err)
 	}
 	return snaps
 }
 
 func mustGetTrackByRelPath(t *testing.T, st *store.Store, relPath string) store.Track {
 	t.Helper()
+	return mustGetTrackBySourceRelPath(t, st, store.SourceMusic, relPath)
+}
 
-	snaps := loadSnapshotsMap(t, st)
+func mustGetTrackBySourceRelPath(t *testing.T, st *store.Store, source, relPath string) store.Track {
+	t.Helper()
+
+	snaps := loadSourceSnapshotsMap(t, st, source)
 	snap, ok := snaps[relPath]
 	if !ok {
-		t.Fatalf("snapshot for %q not found in store (keys=%v)", relPath, mapKeys(snaps))
+		t.Fatalf("snapshot for (%s, %q) not found in store (keys=%v)", source, relPath, mapKeys(snaps))
 	}
 	tr, err := st.GetTrack(context.Background(), snap.ID)
 	if err != nil {
@@ -472,11 +482,11 @@ func TestScanNow_FastPathAndIncremental(t *testing.T) {
 	orig1 := mustGetTrackByRelPath(t, st, "01 - Alpha.wav")
 	backdated := orig1
 	backdated.CreatedAt = time.Date(2020, 5, 6, 7, 8, 9, 0, time.UTC)
-	if _, err := st.LoadSnapshots(context.Background()); err != nil {
+	if _, err := st.LoadSnapshots(context.Background(), store.SourceMusic); err != nil {
 		t.Fatal(err)
 	}
 	// Replace row with explicit older CreatedAt to test preservation across edits.
-	if err := st.DeleteByRelPath(context.Background(), orig1.RelPath); err != nil {
+	if err := st.DeleteByRelPath(context.Background(), store.SourceMusic, orig1.RelPath); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.UpsertTrack(context.Background(), &backdated); err != nil {
@@ -1698,7 +1708,7 @@ func TestService_StartupCountAndCleanShutdown(t *testing.T) {
 			if !ok {
 				t.Fatalf("toRelPath(%q) failed", p)
 			}
-			tr := buildTrack(rel, info.Size(), info.ModTime().UnixNano(), metadata.FallbackFromFilename(p))
+			tr := buildTrack(store.SourceMusic, rel, info.Size(), info.ModTime().UnixNano(), metadata.FallbackFromFilename(p))
 			if err := st.UpsertTrack(context.Background(), &tr); err != nil {
 				t.Fatal(err)
 			}
@@ -1908,6 +1918,1009 @@ func TestService_StartupCountAndCleanShutdown(t *testing.T) {
 		}
 		if err := fw.Add(musicDir); !errors.Is(err, fsnotify.ErrClosed) {
 			t.Errorf("fsWatcher.Add after Wait() error = %v, want fsnotify.ErrClosed", err)
+		}
+	})
+}
+
+func TestNew_MultiRootValidation(t *testing.T) {
+	st := openTestStore(t)
+	baseDir := t.TempDir()
+	musicDir := filepath.Join(baseDir, "music")
+	nestedUploads := filepath.Join(musicDir, "uploads")
+	parentDir := baseDir
+	siblingUploads := filepath.Join(baseDir, "music-uploads")
+	relUploads := " ./relative-uploads "
+
+	tests := []struct {
+		name           string
+		musicDir       string
+		opts           []Option
+		wantErr        bool
+		wantUploadsSet bool
+	}{
+		{
+			name:           "valid sibling uploadsDir normalized to absolute",
+			musicDir:       musicDir,
+			opts:           []Option{WithUploadsDir(siblingUploads)},
+			wantErr:        false,
+			wantUploadsSet: true,
+		},
+		{
+			name:           "relative non-existent uploadsDir normalized without touching disk",
+			musicDir:       musicDir,
+			opts:           []Option{WithUploadsDir(relUploads)},
+			wantErr:        false,
+			wantUploadsSet: true,
+		},
+		{
+			name:           "empty and whitespace WithUploadsDir ignored",
+			musicDir:       musicDir,
+			opts:           []Option{WithUploadsDir(""), WithUploadsDir("  \t\n "), nil},
+			wantErr:        false,
+			wantUploadsSet: false,
+		},
+		{
+			name:           "subsequent empty WithUploadsDir clears prior option",
+			musicDir:       musicDir,
+			opts:           []Option{WithUploadsDir(siblingUploads), WithUploadsDir(" ")},
+			wantErr:        false,
+			wantUploadsSet: false,
+		},
+		{
+			name:     "identical musicDir and uploadsDir rejected",
+			musicDir: musicDir,
+			opts:     []Option{WithUploadsDir(musicDir + string(filepath.Separator) + ".")},
+			wantErr:  true,
+		},
+		{
+			name:     "uploadsDir inside musicDir rejected",
+			musicDir: musicDir,
+			opts:     []Option{WithUploadsDir(nestedUploads)},
+			wantErr:  true,
+		},
+		{
+			name:     "musicDir inside uploadsDir rejected",
+			musicDir: musicDir,
+			opts:     []Option{WithUploadsDir(parentDir)},
+			wantErr:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, err := New(tc.musicDir, 0, st, nil, tc.opts...)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("New(%q) error = %v, wantErr = %v", tc.musicDir, err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if tc.wantUploadsSet {
+				if !filepath.IsAbs(svc.uploadsDir) {
+					t.Errorf("svc.uploadsDir = %q, want non-empty absolute path", svc.uploadsDir)
+				}
+				if len(svc.roots) != 2 {
+					t.Errorf("len(svc.roots) = %d, want 2", len(svc.roots))
+				}
+			} else {
+				if svc.uploadsDir != "" {
+					t.Errorf("svc.uploadsDir = %q, want empty", svc.uploadsDir)
+				}
+				if len(svc.roots) != 1 {
+					t.Errorf("len(svc.roots) = %d, want 1", len(svc.roots))
+				}
+			}
+		})
+	}
+}
+
+func TestMultiRoot_ScanAndSafetyIsolation(t *testing.T) {
+	t.Run("coexisting identical rel_path across roots and empty uploadsDir", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		sharedRel := filepath.Join("Artist", "Album", "01 - Shared.wav")
+		musicShared := filepath.Join(musicDir, sharedRel)
+		musicOnly := filepath.Join(musicDir, "music-only.wav")
+		testutil.WriteMinimalWAV(t, musicShared)
+		testutil.WriteTags(t, musicShared, map[string][]string{taglib.Title: {"Music Shared"}})
+		testutil.WriteMinimalWAV(t, musicOnly)
+
+		logs, logger := newLogCapture()
+		svc := newTestService(t, musicDir, 0, st, logger, WithUploadsDir(uploadsDir))
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("ScanNow() with empty uploadsDir unexpected error: %v", err)
+		}
+		if logs.countWarningsContaining("zero audio files") != 0 {
+			t.Errorf("unexpected zero-file warning when uploadsDir is empty:\n%s", logs.allText())
+		}
+		if got := svc.Status(); got.Count != 2 || got.LastScan.IsZero() {
+			t.Errorf("Status() = %+v, want Count=2 and non-zero LastScan", got)
+		}
+
+		// Now populate uploadsDir with identical rel_path and an uploads-only file.
+		uploadsShared := filepath.Join(uploadsDir, sharedRel)
+		uploadsOnly := filepath.Join(uploadsDir, "uploads-only.wav")
+		testutil.WriteMinimalWAV(t, uploadsShared)
+		testutil.WriteTags(t, uploadsShared, map[string][]string{taglib.Title: {"Uploads Shared"}})
+		testutil.WriteMinimalWAV(t, uploadsOnly)
+
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("ScanNow() with populated both roots unexpected error: %v", err)
+		}
+
+		musicSnaps := loadSourceSnapshotsMap(t, st, store.SourceMusic)
+		uploadsSnaps := loadSourceSnapshotsMap(t, st, store.SourceUploads)
+		if got, want := mapKeys(musicSnaps), []string{"Artist/Album/01 - Shared.wav", "music-only.wav"}; !slices.Equal(got, want) {
+			t.Errorf("music snapshots = %v, want %v", got, want)
+		}
+		if got, want := mapKeys(uploadsSnaps), []string{"Artist/Album/01 - Shared.wav", "uploads-only.wav"}; !slices.Equal(got, want) {
+			t.Errorf("uploads snapshots = %v, want %v", got, want)
+		}
+		if got := svc.Status().Count; got != 4 {
+			t.Errorf("Status().Count = %d, want 4", got)
+		}
+
+		mTr := mustGetTrackBySourceRelPath(t, st, store.SourceMusic, "Artist/Album/01 - Shared.wav")
+		uTr := mustGetTrackBySourceRelPath(t, st, store.SourceUploads, "Artist/Album/01 - Shared.wav")
+		if mTr.ID == uTr.ID || mTr.Source != store.SourceMusic || uTr.Source != store.SourceUploads {
+			t.Errorf("shared rel_path identity = (%q/%s vs %q/%s), want distinct IDs and sources",
+				mTr.ID, mTr.Source, uTr.ID, uTr.Source)
+		}
+		if mTr.Title != "Music Shared" || uTr.Title != "Uploads Shared" {
+			t.Errorf("shared rel_path titles = (%q, %q), want (%q, %q)",
+				mTr.Title, uTr.Title, "Music Shared", "Uploads Shared")
+		}
+	})
+
+	t.Run("zero-file guard isolated per root", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		mKeep := filepath.Join(musicDir, "m-keep.wav")
+		mDrop := filepath.Join(musicDir, "m-drop.wav")
+		uOne := filepath.Join(uploadsDir, "u-one.wav")
+		testutil.WriteMinimalWAV(t, mKeep)
+		testutil.WriteMinimalWAV(t, mDrop)
+		testutil.WriteMinimalWAV(t, uOne)
+
+		logs, logger := newLogCapture()
+		svc := newTestService(t, musicDir, 0, st, logger, WithUploadsDir(uploadsDir))
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("seed ScanNow() unexpected error: %v", err)
+		}
+
+		// Empty uploadsDir while deleting m-drop.wav in musicDir:
+		// uploads must keep u-one.wav (guard tripped) while music must prune m-drop.wav.
+		if err := os.Remove(uOne); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(mDrop); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("ScanNow() unexpected error: %v", err)
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceMusic)), []string{"m-keep.wav"}; !slices.Equal(got, want) {
+			t.Errorf("music snapshots = %v, want %v", got, want)
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceUploads)), []string{"u-one.wav"}; !slices.Equal(got, want) {
+			t.Errorf("uploads snapshots = %v, want %v", got, want)
+		}
+		if logs.countWarningsContaining("uploads directory yielded zero audio files") != 1 {
+			t.Errorf("expected uploads zero-file warning, got:\n%s", logs.allText())
+		}
+		if logs.countWarningsContaining("music directory yielded zero audio files") != 0 {
+			t.Errorf("unexpected music zero-file warning, got:\n%s", logs.allText())
+		}
+
+		// Restore uOne, add uTwo then remove mKeep & uOne:
+		// music must trip zero-file guard while uploads must prune uOne and index uTwo.
+		testutil.WriteMinimalWAV(t, uOne)
+		uTwo := filepath.Join(uploadsDir, "u-two.wav")
+		testutil.WriteMinimalWAV(t, uTwo)
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(mKeep); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(uOne); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("ScanNow() reverse guard unexpected error: %v", err)
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceMusic)), []string{"m-keep.wav"}; !slices.Equal(got, want) {
+			t.Errorf("music snapshots after reverse guard = %v, want %v", got, want)
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceUploads)), []string{"u-two.wav"}; !slices.Equal(got, want) {
+			t.Errorf("uploads snapshots after reverse guard = %v, want %v", got, want)
+		}
+		if logs.countWarningsContaining("music directory yielded zero audio files") != 1 {
+			t.Errorf("expected music zero-file warning, got:\n%s", logs.allText())
+		}
+	})
+
+	t.Run("walk error chmod 0000 in uploadsDir skips deletions only in uploads", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 0o000 walk error test skipped when running as root (UID 0)")
+		}
+
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		mKeep := filepath.Join(musicDir, "m-keep.wav")
+		mDrop := filepath.Join(musicDir, "m-drop.wav")
+		testutil.WriteMinimalWAV(t, mKeep)
+		testutil.WriteMinimalWAV(t, mDrop)
+
+		uBlocked := filepath.Join(uploadsDir, "blocked")
+		testutil.WriteMinimalWAV(t, filepath.Join(uBlocked, "hidden.wav"))
+		uDrop := filepath.Join(uploadsDir, "u-drop.wav")
+		testutil.WriteMinimalWAV(t, uDrop)
+
+		logs, logger := newLogCapture()
+		svc := newTestService(t, musicDir, 0, st, logger, WithUploadsDir(uploadsDir))
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("seed ScanNow() unexpected error: %v", err)
+		}
+
+		if err := os.Chmod(uBlocked, 0o000); err != nil {
+			t.Fatalf("os.Chmod(%q): %v", uBlocked, err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(uBlocked, 0o755) })
+
+		if err := os.Remove(mDrop); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(uDrop); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "u-new.wav"))
+
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("ScanNow() with chmod 0000 in uploads unexpected error: %v", err)
+		}
+
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceMusic)), []string{"m-keep.wav"}; !slices.Equal(got, want) {
+			t.Errorf("music tracks = %v, want %v (stale music track should still prune)", got, want)
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceUploads)), []string{"blocked/hidden.wav", "u-drop.wav", "u-new.wav"}; !slices.Equal(got, want) {
+			t.Errorf("uploads tracks = %v, want %v", got, want)
+		}
+		if logs.countWarningsContaining("skipping stale track deletions") != 1 {
+			t.Errorf("expected 1 pruning-skipped WARN log, got:\n%s", logs.allText())
+		}
+	})
+
+	t.Run("extractFn error in uploadsDir skips deletions only in uploads", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		mKeep := filepath.Join(musicDir, "m-keep.wav")
+		mDrop := filepath.Join(musicDir, "m-drop.wav")
+		testutil.WriteMinimalWAV(t, mKeep)
+		testutil.WriteMinimalWAV(t, mDrop)
+
+		uBad := filepath.Join(uploadsDir, "u-bad.wav")
+		uDrop := filepath.Join(uploadsDir, "u-drop.wav")
+		testutil.WriteMinimalWAV(t, uBad)
+		testutil.WriteMinimalWAV(t, uDrop)
+
+		logs, logger := newLogCapture()
+		svc := newTestService(t, musicDir, 0, st, logger, WithUploadsDir(uploadsDir))
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("seed ScanNow() unexpected error: %v", err)
+		}
+
+		if err := os.Remove(mDrop); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(uDrop); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteMinimalWAV(t, uBad)
+		testutil.WriteTags(t, uBad, map[string][]string{taglib.Title: {"Changed"}})
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "u-new.wav"))
+
+		svc.extractFn = func(path string) (metadata.Info, error) {
+			if path == uBad {
+				return metadata.Info{}, fmt.Errorf("read %q: %w", path, syscall.EIO)
+			}
+			return metadata.Extract(path)
+		}
+
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("ScanNow() unexpected error: %v", err)
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceMusic)), []string{"m-keep.wav"}; !slices.Equal(got, want) {
+			t.Errorf("music tracks = %v, want %v", got, want)
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceUploads)), []string{"u-bad.wav", "u-drop.wav", "u-new.wav"}; !slices.Equal(got, want) {
+			t.Errorf("uploads tracks = %v, want %v", got, want)
+		}
+		if logs.countWarningsContaining("skipping stale track deletions") != 1 {
+			t.Errorf("expected 1 pruning-skipped WARN log, got:\n%s", logs.allText())
+		}
+	})
+
+	t.Run("hard error on one root reconciles healthy root without advancing LastScan", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "m1.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "u1.wav"))
+
+		svc := newTestService(t, musicDir, 0, st, nil, WithUploadsDir(uploadsDir))
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("seed ScanNow() unexpected error: %v", err)
+		}
+		before := svc.Status()
+
+		// Remove musicDir while adding a new file in uploadsDir.
+		if err := os.RemoveAll(musicDir); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "u2.wav"))
+
+		err := svc.ScanNow(context.Background())
+		if err == nil {
+			t.Fatalf("ScanNow() with missing musicDir succeeded, want error")
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceUploads)), []string{"u1.wav", "u2.wav"}; !slices.Equal(got, want) {
+			t.Errorf("uploads tracks = %v, want %v", got, want)
+		}
+		if got, want := mapKeys(loadSourceSnapshotsMap(t, st, store.SourceMusic)), []string{"m1.wav"}; !slices.Equal(got, want) {
+			t.Errorf("music tracks = %v, want %v (preserved on hard error)", got, want)
+		}
+		after := svc.Status()
+		if after.Count != 3 || !after.LastScan.Equal(before.LastScan) || after.Scanning {
+			t.Errorf("Status() after partial failure = %+v, want Count=3, Scanning=false, and unchanged LastScan=%v", after, before.LastScan)
+		}
+	})
+
+	t.Run("mid-walk cancellation on second root preserves first root count without advancing LastScan", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "m1.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "u1.wav"))
+
+		svc := newTestService(t, musicDir, 0, st, nil, WithUploadsDir(uploadsDir))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		svc.extractFn = func(path string) (metadata.Info, error) {
+			if filepath.Base(path) == "u1.wav" {
+				cancel()
+			}
+			return metadata.Extract(path)
+		}
+
+		err := svc.ScanNow(ctx)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ScanNow() error = %v, want context.Canceled", err)
+		}
+		if got := svc.Status(); got.Count != 1 || !got.LastScan.IsZero() || got.Scanning {
+			t.Errorf("Status() after second-root cancel = %+v, want Count=1, zero LastScan, Scanning=false", got)
+		}
+	})
+}
+
+func TestMultiRoot_WatcherIsolationAndOverflow(t *testing.T) {
+	t.Run("live uploads watcher mutations stay isolated from identical rel_path in music and shutdown closes both watchers", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		sharedRel := filepath.Join("shared", "01 - Same.wav")
+		musicShared := filepath.Join(musicDir, sharedRel)
+		uploadsShared := filepath.Join(uploadsDir, sharedRel)
+		testutil.WriteMinimalWAV(t, musicShared)
+		testutil.WriteTags(t, musicShared, map[string][]string{taglib.Title: {"Music Original"}})
+		testutil.WriteMinimalWAV(t, uploadsShared)
+		testutil.WriteTags(t, uploadsShared, map[string][]string{taglib.Title: {"Upload Original"}})
+
+		albumRel := filepath.Join("albumA", "track.wav")
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, albumRel))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, albumRel))
+
+		logs, logger := newLogCapture()
+		svc := newTestService(t, musicDir, 0, st, logger, WithUploadsDir(uploadsDir))
+
+		var (
+			fwMu        sync.Mutex
+			capturedFWs []*fsnotify.Watcher
+		)
+		svc.newWatcherFn = func() (*fsnotify.Watcher, error) {
+			fw, err := fsnotify.NewWatcher()
+			if err == nil {
+				fwMu.Lock()
+				capturedFWs = append(capturedFWs, fw)
+				fwMu.Unlock()
+			}
+			return fw, err
+		}
+
+		_, cancel := startAndWaitReady(t, svc)
+
+		fwMu.Lock()
+		fwCount := len(capturedFWs)
+		fwMu.Unlock()
+		if fwCount != 2 {
+			t.Fatalf("captured watcher count = %d, want 2", fwCount)
+		}
+
+		origMusicShared := mustGetTrackBySourceRelPath(t, st, store.SourceMusic, "shared/01 - Same.wav")
+		origUploadShared := mustGetTrackBySourceRelPath(t, st, store.SourceUploads, "shared/01 - Same.wav")
+		if svc.Status().Count != 4 {
+			t.Fatalf("initial Count = %d, want 4", svc.Status().Count)
+		}
+
+		// 1. Live add and edit in uploadsDir leave music rows intact.
+		uploadNew := filepath.Join(uploadsDir, "shared", "02 - Fresh.wav")
+		testutil.WriteMinimalWAV(t, uploadNew)
+		testutil.WriteTags(t, uploadsShared, map[string][]string{taglib.Title: {"Upload Edited"}})
+		waitForCondition(t, testWaitTimeout, "uploads add and edit reflected", func() bool {
+			snaps := loadSourceSnapshotsMap(t, st, store.SourceUploads)
+			if _, ok := snaps["shared/02 - Fresh.wav"]; !ok {
+				return false
+			}
+			edited := mustGetTrackBySourceRelPath(t, st, store.SourceUploads, "shared/01 - Same.wav")
+			return edited.Title == "Upload Edited" && svc.Status().Count == 5
+		})
+
+		afterEditUpload := mustGetTrackBySourceRelPath(t, st, store.SourceUploads, "shared/01 - Same.wav")
+		if afterEditUpload.ID != origUploadShared.ID || !afterEditUpload.CreatedAt.Equal(origUploadShared.CreatedAt) {
+			t.Errorf("uploads edited identity = (%q, %v), want (%q, %v)",
+				afterEditUpload.ID, afterEditUpload.CreatedAt, origUploadShared.ID, origUploadShared.CreatedAt)
+		}
+		afterEditMusic := mustGetTrackBySourceRelPath(t, st, store.SourceMusic, "shared/01 - Same.wav")
+		if afterEditMusic.Title != "Music Original" || afterEditMusic.ID != origMusicShared.ID {
+			t.Errorf("music shared track mutated unexpectedly: %+v", afterEditMusic)
+		}
+
+		// 2. Live file delete in uploadsDir leaves identical music rel_path intact.
+		if err := os.Remove(uploadsShared); err != nil {
+			t.Fatal(err)
+		}
+		waitForCondition(t, testWaitTimeout, "uploads shared delete isolated", func() bool {
+			_, uExists := loadSourceSnapshotsMap(t, st, store.SourceUploads)["shared/01 - Same.wav"]
+			_, mExists := loadSourceSnapshotsMap(t, st, store.SourceMusic)["shared/01 - Same.wav"]
+			return !uExists && mExists && svc.Status().Count == 4
+		})
+
+		// 3. Directory rename in uploadsDir updates only SourceUploads.
+		if err := os.Rename(filepath.Join(uploadsDir, "albumA"), filepath.Join(uploadsDir, "albumB")); err != nil {
+			t.Fatal(err)
+		}
+		waitForCondition(t, testWaitTimeout, "uploads dir rename isolated", func() bool {
+			uSnaps := loadSourceSnapshotsMap(t, st, store.SourceUploads)
+			mSnaps := loadSourceSnapshotsMap(t, st, store.SourceMusic)
+			_, uOld := uSnaps["albumA/track.wav"]
+			_, uNew := uSnaps["albumB/track.wav"]
+			_, mOrig := mSnaps["albumA/track.wav"]
+			return !uOld && uNew && mOrig && svc.Status().Count == 4
+		})
+
+		// 4. Synthetic root remove/rename on uploads watcher logs "uploads root directory".
+		uw := svc.uploadsWatcher.Load()
+		if uw == nil {
+			t.Fatalf("uploadsWatcher is nil")
+		}
+		uploadsWalkRoot, err := filepath.EvalSymlinks(uploadsDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uw.fsWatcher.Events <- fsnotify.Event{Name: uploadsWalkRoot, Op: fsnotify.Remove}
+		waitForCondition(t, testWaitTimeout, "uploads root remove warning logged", func() bool {
+			return logs.countWarningsContaining("uploads root directory") >= 1
+		})
+
+		// 5. Shutdown closes both watchers cleanly.
+		cancel()
+		svc.Wait()
+
+		if got := svc.pendingCount(); got != 0 {
+			t.Errorf("pendingCount after Wait() = %d, want 0", got)
+		}
+		fwMu.Lock()
+		fws := slices.Clone(capturedFWs)
+		fwMu.Unlock()
+		for i, fw := range fws {
+			if err := fw.Add(uploadsDir); !errors.Is(err, fsnotify.ErrClosed) {
+				t.Errorf("capturedFW[%d].Add after Wait() = %v, want fsnotify.ErrClosed", i, err)
+			}
+		}
+	})
+
+	t.Run("uploads watcher overflow reconciles uploads and advances LastScan when musicDir is unavailable", func(t *testing.T) {
+		st := openTestStore(t)
+		parent := t.TempDir()
+		missingMusicDir := filepath.Join(parent, "missing-music")
+		uploadsDir := filepath.Join(parent, "uploads")
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "01 - Initial.wav"))
+
+		// Pre-seed a SourceMusic track in SQLite to prove overflow rescan on uploads never touches music rows.
+		musicSeed := buildTrack(store.SourceMusic, "01 - SeededMusic.wav", 1234, 5678, metadata.Info{
+			Title:       "Seeded Music",
+			Artist:      "Seed Artist",
+			AlbumArtist: "Seed Artist",
+			Album:       "Seed Album",
+		})
+		if err := st.UpsertTrack(context.Background(), &musicSeed); err != nil {
+			t.Fatal(err)
+		}
+
+		logs, logger := newLogCapture()
+		svc := newTestService(t, missingMusicDir, 0, st, logger, WithUploadsDir(uploadsDir))
+
+		var (
+			fwMu      sync.Mutex
+			uploadsFW *fsnotify.Watcher
+		)
+		svc.newWatcherFn = func() (*fsnotify.Watcher, error) {
+			fw, err := fsnotify.NewWatcher()
+			if err == nil {
+				fwMu.Lock()
+				uploadsFW = fw
+				fwMu.Unlock()
+			}
+			return fw, err
+		}
+
+		_, cancel := startAndWaitReady(t, svc)
+
+		if logs.countWarningsContaining("music directory unavailable") != 1 {
+			t.Errorf("expected music directory unavailable warning, got:\n%s", logs.allText())
+		}
+		if svc.musicWatcher.Load() != nil {
+			t.Fatalf("musicWatcher = non-nil, want nil when musicDir is missing")
+		}
+		if svc.uploadsWatcher.Load() == nil {
+			t.Fatalf("uploadsWatcher = nil, want active uploads watcher")
+		}
+		// Initial ScanNow failed on missingMusicDir while indexing uploadsDir, so LastScan is zero and Count == 2.
+		before := svc.Status()
+		if before.Count != 2 || !before.LastScan.IsZero() {
+			t.Fatalf("initial Status() = %+v, want Count=2 and zero LastScan", before)
+		}
+
+		// Drop a file while temporarily suppressing or triggering overflow via ErrEventOverflow.
+		// Using a non-audio or ignored file won't be indexed, so write a WAV then immediately inject overflow.
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "02 - Overflowed.wav"))
+		fwMu.Lock()
+		fw := uploadsFW
+		fwMu.Unlock()
+		if fw == nil {
+			t.Fatalf("uploadsFW is nil")
+		}
+		fw.Errors <- fsnotify.ErrEventOverflow
+
+		waitForCondition(t, testWaitTimeout, "uploads ErrEventOverflow reconciled and advanced LastScan", func() bool {
+			if logs.countWarningsContaining("overflow") < 1 {
+				return false
+			}
+			stNow := svc.Status()
+			_, u2OK := loadSourceSnapshotsMap(t, st, store.SourceUploads)["02 - Overflowed.wav"]
+			_, mOK := loadSourceSnapshotsMap(t, st, store.SourceMusic)["01 - SeededMusic.wav"]
+			return u2OK && mOK && stNow.Count == 3 && stNow.LastScan.After(before.LastScan)
+		})
+
+		// Verify runLifecycle stayed blocked on <-ctx.Done() and live watching continues.
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "03 - PostOverflowLive.wav"))
+		waitForCondition(t, testWaitTimeout, "live upload after overflow indexed", func() bool {
+			_, ok := loadSourceSnapshotsMap(t, st, store.SourceUploads)["03 - PostOverflowLive.wav"]
+			return ok && svc.Status().Count == 4
+		})
+
+		cancel()
+		svc.Wait()
+		if err := fw.Add(uploadsDir); !errors.Is(err, fsnotify.ErrClosed) {
+			t.Errorf("uploadsFW.Add after Wait() = %v, want fsnotify.ErrClosed", err)
+		}
+	})
+
+	t.Run("missing uploadsDir at Start degrades uploads watcher while keeping music watcher active", func(t *testing.T) {
+		st := openTestStore(t)
+		parent := t.TempDir()
+		musicDir := filepath.Join(parent, "music")
+		missingUploadsDir := filepath.Join(parent, "missing-uploads")
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "01 - Music.wav"))
+
+		logs, logger := newLogCapture()
+		svc := newTestService(t, musicDir, 0, st, logger, WithUploadsDir(missingUploadsDir))
+		startAndWaitReady(t, svc)
+
+		if logs.countWarningsContaining("uploads directory unavailable") != 1 {
+			t.Errorf("expected uploads directory unavailable warning, got:\n%s", logs.allText())
+		}
+		if svc.musicWatcher.Load() == nil {
+			t.Fatalf("musicWatcher = nil, want active music watcher")
+		}
+		if svc.uploadsWatcher.Load() != nil {
+			t.Fatalf("uploadsWatcher = non-nil, want nil when uploadsDir is missing")
+		}
+
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "02 - LiveMusic.wav"))
+		waitForCondition(t, testWaitTimeout, "music watcher stays active when uploadsDir missing", func() bool {
+			_, ok := loadSourceSnapshotsMap(t, st, store.SourceMusic)["02 - LiveMusic.wav"]
+			return ok && svc.Status().Count == 2
+		})
+	})
+
+	t.Run("uploads queue overflow reconciles uploads watches and DB without touching music", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		uploadsWalkRoot, err := filepath.EvalSymlinks(uploadsDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		musicWalkRoot, err := filepath.EvalSymlinks(musicDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "olddir", "shared.wav"))
+		oldUploadsDir := filepath.Join(uploadsDir, "olddir")
+		testutil.WriteMinimalWAV(t, filepath.Join(oldUploadsDir, "shared.wav"))
+
+		svc := newTestService(t, musicDir, 0, st, nil, WithUploadsDir(uploadsDir))
+		svc.maxEventQueue = 2
+
+		dispatchedFirst := make(chan struct{})
+		releaseDispatch := make(chan struct{})
+		var blockOnce sync.Once
+		var releaseOnce sync.Once
+		closeRelease := func() {
+			releaseOnce.Do(func() {
+				close(releaseDispatch)
+			})
+		}
+		svc.beforeDispatch = func(ctx context.Context) {
+			blockOnce.Do(func() {
+				close(dispatchedFirst)
+				select {
+				case <-releaseDispatch:
+				case <-ctx.Done():
+				}
+			})
+		}
+
+		startAndWaitReady(t, svc)
+		t.Cleanup(closeRelease)
+
+		beforeScan := svc.Status().LastScan
+		if err := os.RemoveAll(oldUploadsDir); err != nil {
+			t.Fatal(err)
+		}
+		waitForChan(t, dispatchedFirst, testWaitTimeout, "dispatchedFirst")
+
+		newUploadsDir := filepath.Join(uploadsDir, "newdir")
+		for _, name := range []string{"a.wav", "b.wav", "c.wav", "d.wav"} {
+			testutil.WriteMinimalWAV(t, filepath.Join(newUploadsDir, name))
+		}
+		for i := range 5 {
+			testutil.WriteBytes(t, filepath.Join(uploadsDir, fmt.Sprintf("burst-%d.txt", i)), []byte("overflow"))
+		}
+
+		uw := svc.uploadsWatcher.Load()
+		if uw == nil {
+			t.Fatalf("uploadsWatcher = nil")
+		}
+		waitForCondition(t, testWaitTimeout, "uploads queue overflow triggered rescan", func() bool {
+			return uw.rescanCount.Load() >= 1
+		})
+		closeRelease()
+
+		waitForCondition(t, testWaitTimeout, "uploads overflow updated uploads DB/watches and kept music intact", func() bool {
+			uSnaps := loadSourceSnapshotsMap(t, st, store.SourceUploads)
+			mSnaps := loadSourceSnapshotsMap(t, st, store.SourceMusic)
+			_, uOldExists := uSnaps["olddir/shared.wav"]
+			_, uAOK := uSnaps["newdir/a.wav"]
+			_, uDOK := uSnaps["newdir/d.wav"]
+			_, mSharedOK := mSnaps["olddir/shared.wav"]
+			if uOldExists || !uAOK || !uDOK || !mSharedOK || svc.Status().Count != 5 {
+				return false
+			}
+			if !svc.Status().LastScan.After(beforeScan) {
+				return false
+			}
+			uWatched, uWL := svc.watchSnapshotFor(store.SourceUploads)
+			oldWatch := filepath.Join(uploadsWalkRoot, "olddir")
+			newWatch := filepath.Join(uploadsWalkRoot, "newdir")
+			mWatched, _ := svc.watchSnapshotFor(store.SourceMusic)
+			return !slices.Contains(uWatched, oldWatch) &&
+				!slices.Contains(uWL, oldWatch) &&
+				slices.Contains(uWatched, newWatch) &&
+				slices.Contains(uWL, newWatch) &&
+				slices.Contains(mWatched, filepath.Join(musicWalkRoot, "olddir"))
+		})
+	})
+}
+
+func TestIngestUpload(t *testing.T) {
+	t.Run("insert, overwrite preserving ID and CreatedAt, and coexistence with music root", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+
+		relPath := "Artist/Album/01 - Upload.wav"
+		musicFile := filepath.Join(musicDir, filepath.FromSlash(relPath))
+		testutil.WriteMinimalWAV(t, musicFile)
+		testutil.WriteTags(t, musicFile, map[string][]string{taglib.Title: {"Music Version"}})
+
+		svc := newTestService(t, musicDir, 0, st, nil, WithUploadsDir(uploadsDir))
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatalf("ScanNow() unexpected error: %v", err)
+		}
+		musicTrack := mustGetTrackBySourceRelPath(t, st, store.SourceMusic, relPath)
+
+		uploadFile := filepath.Join(uploadsDir, filepath.FromSlash(relPath))
+		testutil.WriteMinimalWAV(t, uploadFile)
+		testutil.WriteTags(t, uploadFile, map[string][]string{
+			taglib.Title:       {"Upload v1"},
+			taglib.Artist:      {"Upload Artist"},
+			taglib.AlbumArtist: {"Upload Album Artist"},
+			taglib.Album:       {"Upload Album"},
+			taglib.TrackNumber: {"1/10"},
+			taglib.Date:        {"2024"},
+			taglib.Genre:       {"Ambient"},
+		})
+
+		tr1, err := svc.IngestUpload(context.Background(), relPath)
+		if err != nil {
+			t.Fatalf("IngestUpload(v1) unexpected error: %v", err)
+		}
+		if tr1 == nil || !strings.HasPrefix(tr1.ID, "tr_") || tr1.Source != store.SourceUploads || tr1.RelPath != relPath {
+			t.Fatalf("IngestUpload(v1) track = %+v, want SourceUploads, RelPath=%q, and tr_ ID", tr1, relPath)
+		}
+		if tr1.ID == musicTrack.ID {
+			t.Errorf("upload track ID %q collided with music track ID", tr1.ID)
+		}
+		if tr1.Title != "Upload v1" || tr1.Artist != "Upload Artist" || tr1.AlbumArtist != "Upload Album Artist" ||
+			tr1.Album != "Upload Album" || tr1.TrackNum != 1 || tr1.Year != 2024 || tr1.Genre != "Ambient" ||
+			tr1.DurationSec != 2 || tr1.CreatedAt.IsZero() {
+			t.Errorf("IngestUpload(v1) metadata = %+v", tr1)
+		}
+		if got := svc.Status().Count; got != 2 {
+			t.Errorf("Status().Count after initial IngestUpload = %d, want 2", got)
+		}
+
+		// Backdate CreatedAt directly via store so overwrite preservation is observable beyond 1s resolution.
+		backdated := *tr1
+		backdated.CreatedAt = time.Date(2021, 1, 2, 3, 4, 5, 0, time.UTC)
+		if err := st.DeleteByRelPath(context.Background(), store.SourceUploads, relPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpsertTrack(context.Background(), &backdated); err != nil {
+			t.Fatal(err)
+		}
+
+		// Overwrite upload file with new metadata and size.
+		testutil.WriteTags(t, uploadFile, map[string][]string{
+			taglib.Title:       {"Upload v2 Overwritten"},
+			taglib.Artist:      {"Upload Artist"},
+			taglib.AlbumArtist: {"Upload Album Artist"},
+			taglib.Album:       {"Upload Album"},
+		})
+		info2, err := os.Stat(uploadFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		tr2, err := svc.IngestUpload(context.Background(), relPath)
+		if err != nil {
+			t.Fatalf("IngestUpload(v2) unexpected error: %v", err)
+		}
+		if tr2.ID != backdated.ID || !tr2.CreatedAt.Equal(backdated.CreatedAt) {
+			t.Errorf("overwrite identity = (ID=%q, CreatedAt=%v), want (%q, %v)",
+				tr2.ID, tr2.CreatedAt, backdated.ID, backdated.CreatedAt)
+		}
+		if tr2.Title != "Upload v2 Overwritten" || tr2.FileSize != info2.Size() || tr2.MtimeNs != info2.ModTime().UnixNano() {
+			t.Errorf("overwrite fields = %+v, want Title=%q FileSize=%d MtimeNs=%d",
+				tr2, "Upload v2 Overwritten", info2.Size(), info2.ModTime().UnixNano())
+		}
+		if got := svc.Status().Count; got != 2 {
+			t.Errorf("Status().Count after overwrite = %d, want 2", got)
+		}
+		afterMusic := mustGetTrackBySourceRelPath(t, st, store.SourceMusic, relPath)
+		if afterMusic.Title != "Music Version" || afterMusic.ID != musicTrack.ID {
+			t.Errorf("music track modified by upload ingest: %+v", afterMusic)
+		}
+	})
+
+	t.Run("uploadsDir reached through parent symlink still succeeds for regular files inside", func(t *testing.T) {
+		st := openTestStore(t)
+		parent := t.TempDir()
+		musicDir := filepath.Join(parent, "music")
+		realUploads := filepath.Join(parent, "real-uploads")
+		linkUploads := filepath.Join(parent, "uploads-link")
+		if err := os.MkdirAll(musicDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteMinimalWAV(t, filepath.Join(realUploads, "Artist", "01.wav"))
+		if err := os.Symlink(realUploads, linkUploads); err != nil {
+			t.Fatalf("os.Symlink: %v", err)
+		}
+
+		svc := newTestService(t, musicDir, 0, st, nil, WithUploadsDir(linkUploads))
+		tr, err := svc.IngestUpload(context.Background(), "Artist/01.wav")
+		if err != nil {
+			t.Fatalf("IngestUpload through symlinked root unexpected error: %v", err)
+		}
+		if tr.Source != store.SourceUploads || tr.RelPath != "Artist/01.wav" {
+			t.Errorf("IngestUpload track = %+v, want uploads Artist/01.wav", tr)
+		}
+	})
+
+	t.Run("validation, confinement, and error rejections do not mutate store", func(t *testing.T) {
+		st := openTestStore(t)
+		parent := t.TempDir()
+		musicDir := filepath.Join(parent, "music")
+		uploadsDir := filepath.Join(parent, "uploads")
+		outsideDir := filepath.Join(parent, "outside")
+		if err := os.MkdirAll(musicDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Targets for rejection cases.
+		testutil.WriteBytes(t, filepath.Join(uploadsDir, "empty.wav"), nil)
+		testutil.WriteBytes(t, filepath.Join(uploadsDir, "notes.txt"), []byte("not audio"))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, ".DS_Store"))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, ".hidden", "song.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "Artist", ".upload-123.wav"))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "Artist", "song.wav.tmp"))
+		testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, "Artist", "dir.tmp", "song.wav"))
+		if err := os.MkdirAll(filepath.Join(uploadsDir, "dir.wav"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		realInTree := filepath.Join(uploadsDir, "real", "song.wav")
+		testutil.WriteMinimalWAV(t, realInTree)
+		outsideTarget := filepath.Join(outsideDir, "outside.wav")
+		testutil.WriteMinimalWAV(t, outsideTarget)
+
+		if err := os.Symlink(realInTree, filepath.Join(uploadsDir, "leaf-in-tree.wav")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideTarget, filepath.Join(uploadsDir, "leaf-outside.wav")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(uploadsDir, "nonexistent.wav"), filepath.Join(uploadsDir, "leaf-broken.wav")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(uploadsDir, "real"), filepath.Join(uploadsDir, "dir-link-inside")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideDir, filepath.Join(uploadsDir, "dir-link-outside")); err != nil {
+			t.Fatal(err)
+		}
+
+		singleRootSvc := newTestService(t, musicDir, 0, st, nil)
+		if _, err := singleRootSvc.IngestUpload(context.Background(), "song.wav"); err == nil {
+			t.Errorf("IngestUpload on single-root service succeeded, want error")
+		}
+
+		svc := newTestService(t, musicDir, 0, st, nil, WithUploadsDir(uploadsDir))
+
+		canceledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := svc.IngestUpload(canceledCtx, "real/song.wav"); !errors.Is(err, context.Canceled) {
+			t.Errorf("IngestUpload(canceledCtx) error = %v, want context.Canceled", err)
+		}
+		if _, err := svc.IngestUpload(nil, "real/song.wav"); err == nil {
+			t.Errorf("IngestUpload(nil ctx) succeeded, want error")
+		}
+
+		badPaths := []string{
+			"",
+			".",
+			"..",
+			"../outside/outside.wav",
+			"/abs.wav",
+			"real//song.wav",
+			"real/./song.wav",
+			"real/../real/song.wav",
+			"real/",
+			"bad\x00name.wav",
+			".DS_Store",
+			".hidden/song.wav",
+			"Artist/.upload-123.wav",
+			"Artist/song.wav.tmp",
+			"Artist/dir.tmp/song.wav",
+			"notes.txt",
+			"noext",
+			"missing.wav",
+			"empty.wav",
+			"dir.wav",
+			"leaf-in-tree.wav",
+			"leaf-outside.wav",
+			"leaf-broken.wav",
+			"dir-link-inside/song.wav",
+			"dir-link-outside/outside.wav",
+		}
+		for _, p := range badPaths {
+			t.Run(fmt.Sprintf("reject_%q", p), func(t *testing.T) {
+				tr, err := svc.IngestUpload(context.Background(), p)
+				if err == nil {
+					t.Fatalf("IngestUpload(%q) succeeded (%+v), want error", p, tr)
+				}
+			})
+		}
+
+		if got := len(loadSourceSnapshotsMap(t, st, store.SourceUploads)); got != 0 {
+			t.Errorf("uploads snapshots after rejections = %d, want 0", got)
+		}
+		if got := svc.Status().Count; got != 0 {
+			t.Errorf("Status().Count after rejections = %d, want 0", got)
+		}
+	})
+
+	t.Run("concurrent IngestUpload and ScanNow serialize cleanly under race", func(t *testing.T) {
+		st := openTestStore(t)
+		musicDir := t.TempDir()
+		uploadsDir := t.TempDir()
+		testutil.WriteMinimalWAV(t, filepath.Join(musicDir, "m0.wav"))
+
+		svc := newTestService(t, musicDir, 0, st, nil, WithUploadsDir(uploadsDir))
+		if err := svc.ScanNow(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		const nUploads = 8
+		relPaths := make([]string, nUploads)
+		for i := range nUploads {
+			rel := fmt.Sprintf("batch/track-%02d.wav", i)
+			relPaths[i] = rel
+			testutil.WriteMinimalWAV(t, filepath.Join(uploadsDir, filepath.FromSlash(rel)))
+		}
+
+		var wg sync.WaitGroup
+		errCh := make(chan error, nUploads+4)
+		for _, rel := range relPaths {
+			wg.Add(1)
+			go func(r string) {
+				defer wg.Done()
+				tr, err := svc.IngestUpload(context.Background(), r)
+				if err != nil {
+					errCh <- fmt.Errorf("IngestUpload(%q): %w", r, err)
+					return
+				}
+				if tr.Source != store.SourceUploads || tr.RelPath != r {
+					errCh <- fmt.Errorf("IngestUpload(%q) unexpected track %+v", r, tr)
+				}
+			}(rel)
+		}
+		for range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := svc.ScanNow(context.Background()); err != nil {
+					errCh <- fmt.Errorf("ScanNow: %w", err)
+				}
+			}()
+		}
+		wg.Wait()
+		close(errCh)
+
+		for err := range errCh {
+			t.Error(err)
+		}
+		if got := svc.Status().Count; got != nUploads+1 {
+			t.Errorf("final Status().Count = %d, want %d", got, nUploads+1)
 		}
 	})
 }

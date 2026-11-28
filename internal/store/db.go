@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	schemaVersion = 2
+	schemaVersion = 3
 
 	// writeDSNQuery configures the writer pool in WAL mode with immediate write
 	// transactions so concurrent readers never block and read-to-write lock
@@ -108,6 +108,66 @@ var schemaV2Statements = [...]schemaStatement{
 	},
 }
 
+var schemaV3Statements = [...]schemaStatement{
+	{
+		name: "create tracks_v3 table",
+		sql: `CREATE TABLE tracks_v3 (
+			id           TEXT PRIMARY KEY,
+			source       TEXT NOT NULL DEFAULT 'music',
+			rel_path     TEXT NOT NULL,
+			file_size    INTEGER NOT NULL,
+			mtime_ns     INTEGER NOT NULL,
+			title        TEXT NOT NULL,
+			artist       TEXT NOT NULL,
+			album_artist TEXT NOT NULL,
+			artist_id    TEXT NOT NULL,
+			album        TEXT NOT NULL,
+			album_id     TEXT NOT NULL,
+			track_num    INTEGER NOT NULL DEFAULT 0,
+			disc_num     INTEGER NOT NULL DEFAULT 0,
+			year         INTEGER NOT NULL DEFAULT 0,
+			genre        TEXT NOT NULL DEFAULT '',
+			duration_sec INTEGER NOT NULL DEFAULT 0,
+			bit_rate     INTEGER NOT NULL DEFAULT 0,
+			created_at   TEXT NOT NULL,
+			UNIQUE(source, rel_path)
+		)`,
+	},
+	{
+		name: "copy tracks to tracks_v3",
+		sql: `INSERT INTO tracks_v3 (
+			id, source, rel_path, file_size, mtime_ns, title, artist, album_artist,
+			artist_id, album, album_id, track_num, disc_num, year, genre,
+			duration_sec, bit_rate, created_at
+		)
+		SELECT
+			id, 'music', rel_path, file_size, mtime_ns, title, artist, album_artist,
+			artist_id, album, album_id, track_num, disc_num, year, genre,
+			duration_sec, bit_rate, created_at
+		FROM tracks`,
+	},
+	{
+		name: "drop legacy tracks table",
+		sql:  `DROP TABLE tracks`,
+	},
+	{
+		name: "rename tracks_v3 to tracks",
+		sql:  `ALTER TABLE tracks_v3 RENAME TO tracks`,
+	},
+	{
+		name: "recreate artist index",
+		sql:  `CREATE INDEX idx_tracks_artist_id ON tracks (artist_id, album_id, disc_num, track_num, title)`,
+	},
+	{
+		name: "recreate album index",
+		sql:  `CREATE INDEX idx_tracks_album_id ON tracks (album_id, disc_num, track_num, title)`,
+	},
+	{
+		name: "set schema user_version to 3",
+		sql:  `PRAGMA user_version = 3`,
+	},
+}
+
 // Store manages dedicated SQLite WAL writer and read-only reader pools over
 // Headunit's embedded track and authentication database. All methods on Store
 // are safe for concurrent use.
@@ -118,9 +178,9 @@ type Store struct {
 
 // Open opens or creates the SQLite WAL database at the filesystem path dbPath,
 // ensures its parent directory exists, verifies WAL mode, bootstraps or
-// migrates the schema to version 2 atomically, and initializes dedicated writer
+// migrates the schema to version 3 atomically, and initializes dedicated writer
 // and read-only reader pools. It rejects empty paths, directory paths, SQLite
-// :memory:/file: URIs, and databases whose PRAGMA user_version is not 0, 1, or 2.
+// :memory:/file: URIs, and databases whose PRAGMA user_version is not 0, 1, 2, or 3.
 func Open(ctx context.Context, dbPath string) (*Store, error) {
 	absPath, err := resolveDBPath(dbPath)
 	if err != nil {
@@ -258,14 +318,24 @@ func bootstrapSchema(ctx context.Context, db *sql.DB) error {
 		if err := execSchemaStatements(ctx, tx, schemaV2Statements[:]); err != nil {
 			return err
 		}
+		if err := execSchemaStatements(ctx, tx, schemaV3Statements[:]); err != nil {
+			return err
+		}
 	case 1:
 		if err := execSchemaStatements(ctx, tx, schemaV2Statements[:]); err != nil {
+			return err
+		}
+		if err := execSchemaStatements(ctx, tx, schemaV3Statements[:]); err != nil {
+			return err
+		}
+	case 2:
+		if err := execSchemaStatements(ctx, tx, schemaV3Statements[:]); err != nil {
 			return err
 		}
 	case schemaVersion:
 		// Already initialized at current schema version.
 	default:
-		return fmt.Errorf("store: unsupported schema version %d (want 0, 1, or %d)", version, schemaVersion)
+		return fmt.Errorf("store: unsupported schema version %d (want 0, 1, 2, or %d)", version, schemaVersion)
 	}
 
 	if err := tx.Commit(); err != nil {

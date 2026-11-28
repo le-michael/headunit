@@ -926,6 +926,31 @@ func TestStartupAndServeFailureCleanup(t *testing.T) {
 		}
 	})
 
+	t.Run("uploads dir is regular file", func(t *testing.T) {
+		musicDir := t.TempDir()
+		dataDir := t.TempDir()
+		uploadsFile := filepath.Join(dataDir, uploadsDirname)
+		testutil.WriteBytes(t, uploadsFile, []byte("not-a-directory"))
+
+		cfg := config.Config{
+			Port:         "4533",
+			MusicDir:     musicDir,
+			DataDir:      dataDir,
+			ScanInterval: 0,
+		}
+
+		srv, err := newServer(context.Background(), cfg, nil)
+		if err == nil {
+			_ = srv.closeResources()
+			t.Fatalf("newServer() error = nil, want error when uploads dir is a regular file")
+		}
+		if srv != nil {
+			t.Fatalf("newServer() server = %+v, want nil", srv)
+		}
+
+		assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 0)
+	})
+
 	t.Run("corrupt auth key", func(t *testing.T) {
 		dataDir := t.TempDir()
 		secretMaterial := "not-valid-hex-secret-material"
@@ -1012,14 +1037,19 @@ func TestStartupAndServeFailureCleanup(t *testing.T) {
 
 	t.Run("invalid env config", func(t *testing.T) {
 		tests := []struct {
-			name          string
-			port          string
-			scanInterval  string
-			authSecretKey string
+			name               string
+			port               string
+			scanInterval       string
+			authSecretKey      string
+			uploadsEnabled     string
+			uploadMaxFileBytes string
 		}{
 			{name: "PORT=0", port: "0", scanInterval: "0"},
 			{name: "SCAN_INTERVAL=-1s", port: "4533", scanInterval: "-1s"},
 			{name: "AUTH_SECRET_KEY=invalid", port: "4533", scanInterval: "0", authSecretKey: "bad-secret-value"},
+			{name: "UPLOADS_ENABLED=maybe", port: "4533", scanInterval: "0", uploadsEnabled: "maybe"},
+			{name: "UPLOAD_MAX_FILE_BYTES=0", port: "4533", scanInterval: "0", uploadMaxFileBytes: "0"},
+			{name: "UPLOAD_MAX_FILE_BYTES=-1", port: "4533", scanInterval: "0", uploadMaxFileBytes: "-1"},
 		}
 
 		for _, tc := range tests {
@@ -1029,6 +1059,8 @@ func TestStartupAndServeFailureCleanup(t *testing.T) {
 				t.Setenv("DATA_DIR", t.TempDir())
 				t.Setenv("SCAN_INTERVAL", tc.scanInterval)
 				t.Setenv("AUTH_SECRET_KEY", tc.authSecretKey)
+				t.Setenv("UPLOADS_ENABLED", tc.uploadsEnabled)
+				t.Setenv("UPLOAD_MAX_FILE_BYTES", tc.uploadMaxFileBytes)
 
 				err := run(context.Background(), nil)
 				if err == nil {
@@ -1059,6 +1091,8 @@ func TestStartupAndServeFailureCleanup(t *testing.T) {
 		t.Setenv("DATA_DIR", dataDir)
 		t.Setenv("SCAN_INTERVAL", "0")
 		t.Setenv("AUTH_SECRET_KEY", "")
+		t.Setenv("UPLOADS_ENABLED", "")
+		t.Setenv("UPLOAD_MAX_FILE_BYTES", "")
 
 		err = run(context.Background(), slog.New(slog.DiscardHandler))
 		if err == nil {
@@ -1259,6 +1293,378 @@ func TestServeShutdownTimeoutForcesClose(t *testing.T) {
 	assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 0)
 }
 
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestMultiRootServer_UploadsDisabledStillScansWatchesAndStreams(t *testing.T) {
+	t.Run("CreatesUploadsDir0750WhenAbsent", func(t *testing.T) {
+		freshMusicDir := t.TempDir()
+		freshDataDir := t.TempDir()
+		wantUploadsDir := filepath.Join(freshDataDir, uploadsDirname)
+
+		if _, err := os.Lstat(wantUploadsDir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("os.Lstat(%q) err = %v, want ErrNotExist before newServer", wantUploadsDir, err)
+		}
+
+		srv, err := newServer(context.Background(), config.Config{
+			Port:           "4533",
+			MusicDir:       freshMusicDir,
+			DataDir:        freshDataDir,
+			UploadsEnabled: false,
+		}, nil)
+		if err != nil {
+			t.Fatalf("newServer() unexpected error: %v", err)
+		}
+		if got := srv.cfg.UploadsDir; got != wantUploadsDir {
+			t.Errorf("srv.cfg.UploadsDir = %q, want %q", got, wantUploadsDir)
+		}
+
+		info, err := os.Lstat(wantUploadsDir)
+		if err != nil {
+			_ = srv.closeResources()
+			t.Fatalf("os.Lstat(%q) unexpected error: %v", wantUploadsDir, err)
+		}
+		if !info.IsDir() {
+			t.Errorf("%q IsDir = false, want true", wantUploadsDir)
+		}
+		if got, want := info.Mode().Perm(), os.FileMode(0o750); got != want {
+			t.Errorf("%q perm = %o, want %o", wantUploadsDir, got, want)
+		}
+
+		if err := srv.closeResources(); err != nil {
+			t.Fatalf("srv.closeResources() unexpected error: %v", err)
+		}
+		assertResourcesClosed(t, srv)
+	})
+
+	musicDir := t.TempDir()
+	dataDir := t.TempDir()
+	uploadsDir := filepath.Join(dataDir, uploadsDirname)
+
+	const (
+		sharedRel       = "Shared Artist/Shared Album/01 - Twin.flac"
+		uploadedOnlyRel = "Inbox/02 - Uploaded Only.mp3"
+	)
+
+	musicTwinPath := filepath.Join(musicDir, filepath.FromSlash(sharedRel))
+	testutil.WriteMinimalFLAC(t, musicTwinPath)
+	testutil.WriteTags(t, musicTwinPath, map[string][]string{
+		taglib.Title:       {"Twin From Music"},
+		taglib.AlbumArtist: {"Shared Artist"},
+		taglib.Artist:      {"Shared Artist"},
+		taglib.Album:       {"Shared Album"},
+		taglib.TrackNumber: {"1"},
+	})
+	musicTwinBytes := mustReadFile(t, musicTwinPath)
+
+	uploadsTwinPath := filepath.Join(uploadsDir, filepath.FromSlash(sharedRel))
+	testutil.WriteMinimalFLAC(t, uploadsTwinPath)
+	testutil.WriteTags(t, uploadsTwinPath, map[string][]string{
+		taglib.Title:       {"Twin From Uploads"},
+		taglib.AlbumArtist: {"Shared Artist"},
+		taglib.Artist:      {"Shared Artist"},
+		taglib.Album:       {"Shared Album"},
+		taglib.TrackNumber: {"1"},
+	})
+	uploadsTwinBytes := mustReadFile(t, uploadsTwinPath)
+	if bytes.Equal(musicTwinBytes, uploadsTwinBytes) {
+		t.Fatalf("music and uploads twin fixtures unexpectedly identical")
+	}
+
+	uploadedOnlyPath := filepath.Join(uploadsDir, filepath.FromSlash(uploadedOnlyRel))
+	testutil.WriteMinimalMP3(t, uploadedOnlyPath)
+	testutil.WriteTags(t, uploadedOnlyPath, map[string][]string{
+		taglib.Title:       {"Uploaded Only"},
+		taglib.AlbumArtist: {"Upload Artist"},
+		taglib.Artist:      {"Upload Artist"},
+		taglib.Album:       {"Upload Album"},
+		taglib.TrackNumber: {"2"},
+	})
+	uploadedOnlyBytes := mustReadFile(t, uploadedOnlyPath)
+
+	t.Setenv("DATA_DIR", dataDir)
+	t.Setenv("AUTH_SECRET_KEY", "")
+
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	cfg := config.Config{
+		Port:           "4533",
+		MusicDir:       musicDir,
+		DataDir:        dataDir,
+		ScanInterval:   0,
+		UploadsEnabled: false,
+	}
+
+	srv, err := newServer(context.Background(), cfg, logger)
+	if err != nil {
+		t.Fatalf("newServer() unexpected error: %v", err)
+	}
+	if got := srv.cfg.UploadsDir; got != uploadsDir {
+		_ = srv.closeResources()
+		t.Fatalf("srv.cfg.UploadsDir = %q, want %q", got, uploadsDir)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = srv.closeResources()
+		t.Fatalf("net.Listen() unexpected error: %v", err)
+	}
+	baseURL := "http://" + ln.Addr().String()
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- srv.serve(runCtx, ln)
+	}()
+
+	var (
+		waitOnce     sync.Once
+		waitServeErr error
+		waitTimedOut bool
+	)
+	stopAndWait := func(timeout time.Duration) (error, bool) {
+		runCancel()
+		waitOnce.Do(func() {
+			select {
+			case waitServeErr = <-serveErrCh:
+			case <-time.After(timeout):
+				waitTimedOut = true
+			}
+		})
+		return waitServeErr, waitTimedOut
+	}
+	t.Cleanup(func() {
+		err, timedOut := stopAndWait(10 * time.Second)
+		if timedOut {
+			t.Errorf("cleanup: timed out waiting for server.serve to exit")
+			return
+		}
+		if err != nil {
+			t.Errorf("cleanup: server.serve returned unexpected error: %v", err)
+		}
+	})
+
+	const adminPass = "multiroot-admin-secret-1!"
+	var stdout, stderr bytes.Buffer
+	if err := runCLI(
+		context.Background(),
+		[]string{"user", "create", "--username", "alice", "--admin", "--password-stdin"},
+		strings.NewReader(adminPass+"\n"),
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("runCLI(user create alice) unexpected error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	t.Cleanup(client.CloseIdleConnections)
+	aliceAuth := func(salt string) url.Values {
+		return saltedMD5Params("alice", adminPass, salt)
+	}
+
+	pollScanStatus(t, client, baseURL, aliceAuth, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
+		return !s.Scanning && s.Count == 3 && s.LastScan != ""
+	})
+
+	if logs := logBuf.String(); !strings.Contains(logs, "uploads_dir="+uploadsDir) {
+		t.Errorf("startup logs = %q, want substring %q", logs, "uploads_dir="+uploadsDir)
+	}
+
+	searchEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/search3?f=json&query=%22%22&artistCount=500&albumCount=500&songCount=500", aliceAuth("mr-search")))
+	assertJSONResponseEnvelope(t, searchEnv, "ok")
+	if searchEnv.SearchResult3 == nil || len(searchEnv.SearchResult3.Song) != 3 {
+		t.Fatalf("search3 result = %+v, want 3 songs", searchEnv.SearchResult3)
+	}
+
+	musicTwin, ok := findSongByPath(searchEnv.SearchResult3.Song, sharedRel)
+	if !ok {
+		t.Fatalf("search3 missing music twin path %q: %+v", sharedRel, searchEnv.SearchResult3.Song)
+	}
+	if musicTwin.Title != "Twin From Music" {
+		t.Errorf("musicTwin.Title = %q, want %q", musicTwin.Title, "Twin From Music")
+	}
+
+	uploadsTwin, ok := findSongByPath(searchEnv.SearchResult3.Song, "uploads/"+sharedRel)
+	if !ok {
+		t.Fatalf("search3 missing uploads twin path %q: %+v", "uploads/"+sharedRel, searchEnv.SearchResult3.Song)
+	}
+	if uploadsTwin.Title != "Twin From Uploads" {
+		t.Errorf("uploadsTwin.Title = %q, want %q", uploadsTwin.Title, "Twin From Uploads")
+	}
+	if musicTwin.ID == uploadsTwin.ID {
+		t.Fatalf("musicTwin.ID == uploadsTwin.ID (%q), want distinct IDs", musicTwin.ID)
+	}
+
+	uploadedOnly, ok := findSongByPath(searchEnv.SearchResult3.Song, "uploads/"+uploadedOnlyRel)
+	if !ok {
+		t.Fatalf("search3 missing uploaded-only path %q: %+v", "uploads/"+uploadedOnlyRel, searchEnv.SearchResult3.Song)
+	}
+
+	// Verify getSong emits disambiguated Path in both JSON and XML.
+	getSongJSON, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/getSong?f=json&id="+url.QueryEscape(uploadsTwin.ID), aliceAuth("mr-song-json")))
+	assertJSONResponseEnvelope(t, getSongJSON, "ok")
+	if getSongJSON.Song == nil || getSongJSON.Song.Path != "uploads/"+sharedRel {
+		t.Errorf("getSong JSON = %+v, want Path=%q", getSongJSON.Song, "uploads/"+sharedRel)
+	}
+
+	getSongXMLResp, getSongXMLBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/getSong?id="+url.QueryEscape(uploadsTwin.ID), aliceAuth("mr-song-xml")), nil, nil)
+	if got, want := getSongXMLResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("GET /rest/getSong XML status = %d, want %d", got, want)
+	}
+	getSongXML := decodeXMLResponse(t, getSongXMLBody)
+	assertXMLResponseEnvelope(t, getSongXML, "ok")
+	if getSongXML.Song == nil || getSongXML.Song.Path != "uploads/"+sharedRel {
+		t.Errorf("getSong XML = %+v, want Path=%q", getSongXML.Song, "uploads/"+sharedRel)
+	}
+
+	// Verify direct streaming (200/206/416/HEAD) across both roots.
+	musicResp, musicBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(musicTwin.ID), aliceAuth("mr-stream-music")), nil, nil)
+	if got, want := musicResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("stream music twin status = %d, want %d", got, want)
+	}
+	if !bytes.Equal(musicBody, musicTwinBytes) {
+		t.Errorf("music twin stream body mismatch: got %d bytes, want %d bytes", len(musicBody), len(musicTwinBytes))
+	}
+
+	uploadsResp, uploadsBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(uploadsTwin.ID), aliceAuth("mr-stream-uploads")), nil, nil)
+	if got, want := uploadsResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("stream uploads twin status = %d, want %d", got, want)
+	}
+	if got, want := uploadsResp.Header.Get("Content-Type"), "audio/flac"; got != want {
+		t.Errorf("uploads twin Content-Type = %q, want %q", got, want)
+	}
+	if got, want := uploadsResp.Header.Get("Accept-Ranges"), "bytes"; got != want {
+		t.Errorf("uploads twin Accept-Ranges = %q, want %q", got, want)
+	}
+	if got := uploadsResp.Header.Get("ETag"); got == "" || got == musicResp.Header.Get("ETag") {
+		t.Errorf("uploads twin ETag = %q (music=%q), want distinct non-empty ETag", got, musicResp.Header.Get("ETag"))
+	}
+	if !bytes.Equal(uploadsBody, uploadsTwinBytes) {
+		t.Errorf("uploads twin stream body mismatch: got %d bytes, want %d bytes", len(uploadsBody), len(uploadsTwinBytes))
+	}
+
+	rangeResp, rangeBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(uploadsTwin.ID), aliceAuth("mr-stream-206")), nil, map[string]string{"Range": "bytes=0-3"})
+	if got, want := rangeResp.StatusCode, http.StatusPartialContent; got != want {
+		t.Fatalf("stream uploads 206 status = %d, want %d", got, want)
+	}
+	wantRange := fmt.Sprintf("bytes 0-3/%d", len(uploadsTwinBytes))
+	if got := rangeResp.Header.Get("Content-Range"); got != wantRange {
+		t.Errorf("uploads 206 Content-Range = %q, want %q", got, wantRange)
+	}
+	if got, want := string(rangeBody), "fLaC"; got != want {
+		t.Errorf("uploads 206 body = %q, want %q", got, want)
+	}
+
+	oobResp, _ := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(uploadsTwin.ID), aliceAuth("mr-stream-416")), nil, map[string]string{"Range": "bytes=9999999-"})
+	if got, want := oobResp.StatusCode, http.StatusRequestedRangeNotSatisfiable; got != want {
+		t.Errorf("stream uploads 416 status = %d, want %d", got, want)
+	}
+	want416 := fmt.Sprintf("bytes */%d", len(uploadsTwinBytes))
+	if got := oobResp.Header.Get("Content-Range"); got != want416 {
+		t.Errorf("uploads 416 Content-Range = %q, want %q", got, want416)
+	}
+
+	headResp, headBody := doHTTPRequest(t, client, http.MethodHead, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(uploadedOnly.ID), aliceAuth("mr-stream-head")), nil, nil)
+	if got, want := headResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("HEAD uploads status = %d, want %d", got, want)
+	}
+	if got, want := headResp.Header.Get("Content-Type"), "audio/mpeg"; got != want {
+		t.Errorf("HEAD uploads Content-Type = %q, want %q", got, want)
+	}
+	if got, want := headResp.Header.Get("Accept-Ranges"), "bytes"; got != want {
+		t.Errorf("HEAD uploads Accept-Ranges = %q, want %q", got, want)
+	}
+	if got, want := headResp.Header.Get("Content-Length"), strconv.Itoa(len(uploadedOnlyBytes)); got != want {
+		t.Errorf("HEAD uploads Content-Length = %q, want %q", got, want)
+	}
+	if got := len(headBody); got != 0 {
+		t.Errorf("HEAD uploads body len = %d, want 0", got)
+	}
+
+	// Verify live uploads watcher picks up new files and isolates deletions from music root.
+	stagedPath := filepath.Join(t.TempDir(), "03 - Live Upload.flac")
+	testutil.WriteMinimalFLAC(t, stagedPath)
+	testutil.WriteTags(t, stagedPath, map[string][]string{
+		taglib.Title:       {"Live Upload"},
+		taglib.AlbumArtist: {"Live Uploader"},
+		taglib.Artist:      {"Live Uploader"},
+		taglib.Album:       {"Live Uploads"},
+		taglib.TrackNumber: {"1"},
+	})
+	liveUploadBytes := mustReadFile(t, stagedPath)
+
+	liveUploadPath := filepath.Join(uploadsDir, "live-drop", "03 - Live Upload.flac")
+	testutil.WriteBytes(t, liveUploadPath, liveUploadBytes)
+
+	pollScanStatus(t, client, baseURL, aliceAuth, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
+		return !s.Scanning && s.Count == 4
+	})
+
+	liveSearch, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/search3?f=json&query=Live+Upload", aliceAuth("mr-live-search")))
+	assertJSONResponseEnvelope(t, liveSearch, "ok")
+	if liveSearch.SearchResult3 == nil {
+		t.Fatalf("search3 Live Upload missing searchResult3 payload")
+	}
+	liveSong, ok := findSongByPath(liveSearch.SearchResult3.Song, "uploads/live-drop/03 - Live Upload.flac")
+	if !ok {
+		t.Fatalf("search3 Live Upload songs = %+v, want uploads/live-drop/03 - Live Upload.flac", liveSearch.SearchResult3.Song)
+	}
+	liveResp, liveBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(liveSong.ID), aliceAuth("mr-live-stream")), nil, nil)
+	if got, want := liveResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("stream live upload status = %d, want %d", got, want)
+	}
+	if !bytes.Equal(liveBody, liveUploadBytes) {
+		t.Errorf("live upload stream body mismatch: got %d bytes, want %d bytes", len(liveBody), len(liveUploadBytes))
+	}
+
+	if err := os.Remove(uploadsTwinPath); err != nil {
+		t.Fatalf("os.Remove(%q) unexpected error: %v", uploadsTwinPath, err)
+	}
+	pollScanStatus(t, client, baseURL, aliceAuth, e2ePollTimeout, func(s subsonic.ScanStatus) bool {
+		return !s.Scanning && s.Count == 3
+	})
+
+	deletedEnv, _ := getJSONResponse(t, client, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(uploadsTwin.ID)+"&f=json", aliceAuth("mr-del-uploads")))
+	assertJSONResponseEnvelope(t, deletedEnv, "failed")
+	if deletedEnv.Error == nil || deletedEnv.Error.Code != 70 {
+		t.Errorf("stream deleted uploads twin error = %+v, want code 70", deletedEnv.Error)
+	}
+
+	// Deleting uploads/<sharedRel> must leave music/<sharedRel> intact and streamable.
+	musicStillResp, musicStillBody := doHTTPRequest(t, client, http.MethodGet, withQueryParams(baseURL+"/rest/stream?id="+url.QueryEscape(musicTwin.ID), aliceAuth("mr-music-intact")), nil, nil)
+	if got, want := musicStillResp.StatusCode, http.StatusOK; got != want {
+		t.Fatalf("stream music twin after uploads delete status = %d, want %d", got, want)
+	}
+	if !bytes.Equal(musicStillBody, musicTwinBytes) {
+		t.Errorf("music twin stream body after uploads delete mismatch: got %d bytes, want %d bytes", len(musicStillBody), len(musicTwinBytes))
+	}
+
+	serveErr, timedOut := stopAndWait(10 * time.Second)
+	if timedOut {
+		t.Fatalf("timed out waiting for graceful shutdown")
+	}
+	if serveErr != nil {
+		t.Fatalf("server.serve() error = %v, want nil", serveErr)
+	}
+
+	assertResourcesClosed(t, srv)
+	assertDBReopensCleanly(t, filepath.Join(dataDir, dbFilename), 3)
+}
+
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -1449,11 +1855,13 @@ func assertResourcesClosed(t *testing.T, srv *server) {
 		t.Errorf("store.TrackCount() succeeded after shutdown, want closed-DB error")
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/rest/stream", nil)
-	rec := httptest.NewRecorder()
-	err := srv.streamer.Stream(rec, req, &store.Track{ID: "tr_probe", RelPath: "probe.wav"}, stream.StreamOptions{})
-	if !errors.Is(err, os.ErrClosed) {
-		t.Errorf("streamer.Stream() after close error = %v, want errors.Is(err, os.ErrClosed)", err)
+	for _, src := range []string{store.SourceMusic, store.SourceUploads} {
+		req := httptest.NewRequest(http.MethodGet, "/rest/stream", nil)
+		rec := httptest.NewRecorder()
+		err := srv.streamer.Stream(rec, req, &store.Track{ID: "tr_probe", Source: src, RelPath: "probe.wav"}, stream.StreamOptions{})
+		if !errors.Is(err, os.ErrClosed) {
+			t.Errorf("streamer.Stream(source=%q) after close error = %v, want errors.Is(err, os.ErrClosed)", src, err)
+		}
 	}
 }
 

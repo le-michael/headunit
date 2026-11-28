@@ -352,7 +352,7 @@ func toChild(t store.Track) Child {
 		Suffix:      suffix,
 		Duration:    t.DurationSec,
 		BitRate:     t.BitRate,
-		Path:        t.RelPath,
+		Path:        trackDisplayPath(t),
 		IsVideo:     false,
 		DiscNumber:  t.DiscNum,
 		Created:     formatOptionalTimestamp(t.CreatedAt),
@@ -360,6 +360,13 @@ func toChild(t store.Track) Child {
 		ArtistID:    t.ArtistID,
 		Type:        mediaTypeMusic,
 	}
+}
+
+func trackDisplayPath(t store.Track) string {
+	if t.Source == store.SourceUploads {
+		return "uploads/" + t.RelPath
+	}
+	return t.RelPath
 }
 
 func toChildren(tracks []store.Track) []Child {

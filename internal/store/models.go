@@ -18,6 +18,14 @@ var ErrAlreadyExists = errors.New("store: already exists")
 // MaxPageLimit is the upper bound enforced on paginated album and search queries.
 const MaxPageLimit = 500
 
+const (
+	// SourceMusic identifies tracks indexed from the read-only MUSIC_DIR root.
+	SourceMusic = "music"
+
+	// SourceUploads identifies tracks stored under the server-managed <DATA_DIR>/uploads root.
+	SourceUploads = "uploads"
+)
+
 // AlbumListSort selects the ordering applied by Store.ListAlbums.
 type AlbumListSort string
 
@@ -43,7 +51,11 @@ type Track struct {
 	// ID is the opaque stable track identifier ("tr_" + 32 hex chars).
 	ID string
 
-	// RelPath is the forward-slash path relative to the music root. Write
+	// Source identifies the storage root (SourceMusic or SourceUploads). Empty
+	// defaults to SourceMusic on write operations.
+	Source string
+
+	// RelPath is the forward-slash path relative to the track's Source root. Write
 	// methods (UpsertTrack, DeleteByRelPath, ApplyScanBatch) require RelPath
 	// to satisfy io/fs.ValidPath and not equal ".".
 	RelPath string
@@ -142,7 +154,7 @@ type TrackSnapshot struct {
 	// ID is the stable track identifier.
 	ID string
 
-	// RelPath is the forward-slash path relative to the music root.
+	// RelPath is the forward-slash path relative to the source root.
 	RelPath string
 
 	// FileSize is the last indexed file size in bytes.

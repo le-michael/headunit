@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ const (
 	defaultIdleTimeout       = 120 * time.Second
 	defaultShutdownTimeout   = 10 * time.Second
 	dbFilename               = "headunit.db"
+	uploadsDirname           = "uploads"
 )
 
 type server struct {
@@ -115,11 +117,23 @@ func newServer(ctx context.Context, cfg config.Config, logger *slog.Logger) (*se
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 
+	uploadsDir := strings.TrimSpace(cfg.UploadsDir)
+	if uploadsDir == "" {
+		uploadsDir = filepath.Join(cfg.DataDir, uploadsDirname)
+	} else {
+		uploadsDir = filepath.Clean(uploadsDir)
+	}
+	cfg.UploadsDir = uploadsDir
+
 	srv := &server{
 		cfg:             cfg,
 		logger:          logger,
 		store:           st,
 		shutdownTimeout: defaultShutdownTimeout,
+	}
+
+	if err := os.MkdirAll(uploadsDir, 0o750); err != nil {
+		return nil, errors.Join(fmt.Errorf("init uploads dir: %w", err), srv.closeResources())
 	}
 
 	authKey, err := auth.LoadOrCreateKey(cfg.DataDir, cfg.AuthSecretKey)
@@ -135,13 +149,13 @@ func newServer(ctx context.Context, cfg config.Config, logger *slog.Logger) (*se
 		return nil, errors.Join(fmt.Errorf("init authenticator: %w", err), srv.closeResources())
 	}
 
-	streamer, err := stream.NewDirectStreamer(cfg.MusicDir)
+	streamer, err := stream.NewDirectStreamer(cfg.MusicDir, stream.WithUploadsDir(uploadsDir))
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("init streamer: %w", err), srv.closeResources())
 	}
 	srv.streamer = streamer
 
-	scanSvc, err := scanner.New(cfg.MusicDir, cfg.ScanInterval, st, logger)
+	scanSvc, err := scanner.New(cfg.MusicDir, cfg.ScanInterval, st, logger, scanner.WithUploadsDir(uploadsDir))
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("init scanner: %w", err), srv.closeResources())
 	}
@@ -195,6 +209,7 @@ func (s *server) serve(ctx context.Context, ln net.Listener) error {
 		"addr", ln.Addr().String(),
 		"music_dir", s.cfg.MusicDir,
 		"data_dir", s.cfg.DataDir,
+		"uploads_dir", s.cfg.UploadsDir,
 		"scan_interval", s.cfg.ScanInterval,
 	)
 
@@ -244,7 +259,7 @@ func (s *server) closeResources() error {
 	if s == nil {
 		return nil
 	}
-	// Close streamer before store so the confined music root handle is released
+	// Close streamer before store so confined root handles are released
 	// before SQLite checkpoints WAL state and closes its pools.
 	var streamerErr, storeErr error
 	if s.streamer != nil {
